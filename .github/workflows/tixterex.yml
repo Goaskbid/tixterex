@@ -37,14 +37,27 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    permissions:
+      contents: read
+      actions: write
     outputs:
       ready: ${{ steps.r.outputs.ready }}
     steps:
+      # GitHub Pages only accepts deploys from the main branch. A published release runs on its tag, so it hands the
+      # work to a run on main (same file, same release zips) instead of deploying itself and being rejected.
       - id: r
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          WF: ${{ github.workflow_ref }}
         run: |
+          if [ "$EVENT" = "release" ]; then
+            F=$(basename "${WF%@*}")
+            B=$(gh api "repos/$REPO" --jq .default_branch)
+            gh workflow run "$F" --repo "$REPO" --ref "$B"
+            echo "ready=false" >> "$GITHUB_OUTPUT"; echo "::notice::New release: the deploy now runs on $B (see the next run in the list)."; exit 0
+          fi
           if gh api "repos/$REPO/contents/site/index.html" >/dev/null 2>&1 || gh release view --repo "$REPO" >/dev/null 2>&1; then echo "ready=true" >> "$GITHUB_OUTPUT"; else echo "ready=false" >> "$GITHUB_OUTPUT"; echo "::notice::Waiting for the website: create a release and attach tixterex-release.zip."; fi
   build:
     needs: check
@@ -102,11 +115,10 @@ jobs:
           if [ -n "$CLOUDFLARE_API_TOKEN" ]; then T=$(printf '%s' "$CLOUDFLARE_API_TOKEN:tf-contrib" | sha256sum | cut -c1-64); echo "::add-mask::$T"; echo "CONTRIB_TOKEN=$T" >> "$GITHUB_ENV"; fi
       - name: Read at most once a day (an upload on the same day reuses last night's programmes)
         id: once
-        if: github.event_name != 'push'
         run: |
           if [ -f _ingest/.read_at ] && [ $(( $(date +%s) - $(cat _ingest/.read_at 2>/dev/null || echo 0) )) -lt 72000 ]; then echo "read=no" >> "$GITHUB_OUTPUT"; echo "::notice::Programmes were read less than 20 hours ago; reusing them (one read a day at most)."; else echo "read=yes" >> "$GITHUB_OUTPUT"; fi
       - name: Read venue programmes (capped, polite, facts only)
-        if: github.event_name != 'push' && steps.once.outputs.read == 'yes'
+        if: steps.once.outputs.read == 'yes'
         continue-on-error: true
         env:
           INGEST_TM_KEY: ${{ secrets.TM_KEY }}
@@ -167,7 +179,7 @@ jobs:
             echo "Links rewritten for https://$OWNER_LC.github.io/$NAME/"
           fi
       - name: Keep tonight's programmes for tomorrow
-        if: always() && github.event_name != 'push'
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: _ingest
