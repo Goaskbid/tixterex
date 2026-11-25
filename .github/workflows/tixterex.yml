@@ -1,257 +1,174 @@
-# TixTerex — nightly venue programmes + site deploy (A36, owner decision 15 Nov 2026).
-# Built so GitHub has nothing to object to:
-#  · runs once a day (02:17 UTC) and on your own uploads; one job at a time; hard limit 30 minutes;
-#  · the reader stops itself at 3,000 polite requests or 20 minutes, spread over many different websites,
-#    never two requests to the same site closer than 1.5 s, robots.txt honoured, honest User-Agent;
-#  · it commits NOTHING: the programmes go straight into the Pages deploy and are carried to the next
-#    night in the Actions cache, so the repository never grows;
-#  · facts only (title, date, time, place, price, link) from each organiser's own published event data.
-# Hosting (A63, owner instruction 21 Nov 2026 — Cloudflare Workers Paid for all five sites):
-#  · GitHub Pages keeps serving exactly as today. Adding CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID as REPOSITORY
-#    Actions secrets (GitHub Free does not pass organisation secrets to private repositories) only ADDS a Cloudflare
-#    preview on a workers.dev address; nothing switches by itself.
-#  · Zero extra Cloudflare cost: the website is static files only (no script, so no request is ever billed); the
-#    suggestion box is a separate script, deployed only on go-live and only while the account is below 70% of its
-#    included script requests, with a 1.5 million a month cap of its own and a flood rule in front of it.
-#  · The switch is a release that carries tools/cloudflare/GO_LIVE (shipped only after the owner's yes): the site is then
-#    served by Cloudflare on tixterex.com, the suggestion box goes on, and GitHub Pages is no longer deployed.
-name: TixTerex nightly programmes and deploy
-on:
-  schedule:
-    - cron: '17 2 * * *'
+# R93 (same build/deploy contract as R92): one explicit artifact, validated package, scoped caches, visible supply health.
+# This workflow builds and deploys. It does NOT crawl third-party sites on GitHub.
+name: TixTerex validate and deploy
+"on":
   push:
     branches: [main]
+    paths:
+      - '.github/workflows/tixterex.yml'
+      - 'site/**'
+      - 'src/**'
+      - 'tools/**'
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      source:
+        description: 'Use the release ZIPs or the checked-in source tree'
+        type: choice
+        options: [release, repository]
+        default: release
+      release_tag:
+        description: 'Exact release tag; blank uses the latest published release'
+        type: string
+        default: ''
 permissions:
   contents: read
-  pages: write
-  id-token: write
 concurrency:
   group: tixterex-pages
   cancel-in-progress: false
 jobs:
-  # Two ways to bring the website: its files in the repository, or (simpler) a release with tixterex-release.zip
-  # attached. Until either exists, nothing runs (no red error on the very first upload).
-  check:
+  route:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
       contents: read
       actions: write
     outputs:
-      ready: ${{ steps.r.outputs.ready }}
+      build_here: ${{ steps.route.outputs.build_here }}
     steps:
-      # GitHub Pages only accepts deploys from the main branch. A published release runs on its tag, so it hands the
-      # work to a run on main (same file, same release zips) instead of deploying itself and being rejected.
-      - id: r
+      - id: route
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           WF: ${{ github.workflow_ref }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [ "$EVENT" = "release" ]; then
+          set -euo pipefail
+          if [ "$EVENT" = release ]; then
             F=$(basename "${WF%@*}")
             B=$(gh api "repos/$REPO" --jq .default_branch)
-            gh workflow run "$F" --repo "$REPO" --ref "$B"
-            echo "ready=false" >> "$GITHUB_OUTPUT"; echo "::notice::New release: the deploy now runs on $B (see the next run in the list)."; exit 0
+            gh workflow run "$F" --repo "$REPO" --ref "$B" -f source=release -f "release_tag=$TAG"
+            echo 'build_here=false' >> "$GITHUB_OUTPUT"
+            echo "Release $TAG handed to the default branch $B with the exact tag." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'build_here=true' >> "$GITHUB_OUTPUT"
           fi
-          if gh api "repos/$REPO/contents/site/index.html" >/dev/null 2>&1 || gh release view --repo "$REPO" >/dev/null 2>&1; then echo "ready=true" >> "$GITHUB_OUTPUT"; else echo "ready=false" >> "$GITHUB_OUTPUT"; echo "::notice::Waiting for the website: create a release and attach tixterex-release.zip."; fi
   build:
-    needs: check
-    if: needs.check.outputs.ready == 'true'
+    needs: route
+    if: needs.route.outputs.build_here == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-    outputs:
-      target: ${{ steps.where.outputs.target }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - name: Unpack the latest release (when the website comes as tixterex-release.zip)
+          node-version: '22'
+      - name: Select exactly one artifact source
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          INPUT_SOURCE: ${{ inputs.source }}
+          CONFIG_SOURCE: ${{ vars.TIXTEREX_ARTIFACT_SOURCE }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          if [ ! -f site/index.html ]; then
-            gh release download --repo "$REPO" --pattern '*.zip' --dir _rel --clobber
-            # a release may come in several parts, each under 25 MB (website + place directory); all parts are merged
-            mkdir -p _relx && for Z in _rel/*.zip; do unzip -qo "$Z" -d _relx; done; Z=$(ls _rel/*.zip | tr '\n' ' ')
-            R=$(dirname "$(dirname "$(find _relx -path '*/site/index.html' | head -1)")")
-            cp -r "$R/site" "$R/tools" . && rm -rf _rel _relx
-            echo "Website taken from release assets: $Z"
+          set -euo pipefail
+          SOURCE="${INPUT_SOURCE:-${CONFIG_SOURCE:-release}}"
+          if [ "$SOURCE" = repository ]; then
+            test -f site/index.html
+            test -f tools/release/assemble.py
+            echo 'TF_INPUT=.' >> "$GITHUB_ENV"
+            echo 'TF_ARTIFACT=repository' >> "$GITHUB_ENV"
+            echo 'Artifact: checked-in repository source.' >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$SOURCE" = release ]; then
+            if [ -z "$RELEASE_TAG" ]; then RELEASE_TAG=$(gh release view -R "$REPO" --json tagName --jq .tagName); fi
+            mkdir -p _release_assets _package
+            for ASSET in tixterex-release.zip tixterex-places-1.zip tixterex-places-2.zip; do
+              gh release download "$RELEASE_TAG" -R "$REPO" --pattern "$ASSET" --dir _release_assets --clobber
+            done
+            if gh release view "$RELEASE_TAG" -R "$REPO" --json assets --jq '.assets[].name' | grep -qx 'tixterex-inventory.zip'; then
+              gh release download "$RELEASE_TAG" -R "$REPO" --pattern tixterex-inventory.zip --dir _release_assets --clobber
+            fi
+            python3 - <<'PY'
+          import pathlib,zipfile,subprocess,sys
+          z=zipfile.ZipFile('_release_assets/tixterex-release.zip')
+          body=z.read('tixterex/tools/release/verify_inputs.py')
+          p=pathlib.Path('_verify_tixterex_inputs.py');p.write_bytes(body)
+          subprocess.run([sys.executable,str(p),'_release_assets','_package'],check=True)
+          PY
+            echo 'TF_INPUT=_package/tixterex' >> "$GITHUB_ENV"
+            echo "TF_ARTIFACT=release:$RELEASE_TAG" >> "$GITHUB_ENV"
+            echo "Artifact: release **$RELEASE_TAG**, exact three named ZIPs. Repository site is not used." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Invalid source: choose release or repository.' >&2; exit 1
           fi
-      - name: Find the website folder
-        run: |
-          if [ -f site/index.html ]; then echo "SRC=site" >> "$GITHUB_ENV"; else echo "SRC=." >> "$GITHUB_ENV"; fi
-      - name: Apply the brand (A78 - name and web address from tools/brand/brand.json, or the BRAND_NAME or BRAND_DOMAIN variables)
-        env:
-          BRAND_NAME: ${{ vars.BRAND_NAME }}
-          BRAND_DOMAIN: ${{ vars.BRAND_DOMAIN }}
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          # the web address: the variable, else the custom domain set under Settings → Pages, else the brand file
-          D="$BRAND_DOMAIN"; if [ -z "$D" ]; then D=$(gh api "repos/$REPO/pages" --jq '.cname // empty' 2>/dev/null || true); fi
-          if ! printf '%s' "$D" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then D=""; fi
-          # switches every visible name and address in this run's copy (the repository itself stays as it is) and,
-          # for a new name, draws the logo, app icons, favicon and social picture with the runner's own Chrome
-          node tools/rebrand.mjs --name "$BRAND_NAME" --domain "$D" "$SRC" tools
-          echo "TF_DOMAIN=$(node -e 'import("./tools/rebrand.mjs").then(m=>process.stdout.write(m.resolveBrand({name:process.argv[1],domain:process.argv[2]}).domain))' "$BRAND_NAME" "$D")" >> "$GITHUB_ENV"
-      - name: Bring back last night's programmes
+      - name: Recover existing collection state without rerunning the crawler
         uses: actions/cache/restore@v4
         with:
           path: _ingest
-          key: ingest-${{ github.run_id }}
-          restore-keys: ingest-
-      - name: Key for the suggestion box (derived from the Cloudflare token, never printed)
-        run: |
-          if [ -n "$CLOUDFLARE_API_TOKEN" ]; then T=$(printf '%s' "$CLOUDFLARE_API_TOKEN:tf-contrib" | sha256sum | cut -c1-64); echo "::add-mask::$T"; echo "CONTRIB_TOKEN=$T" >> "$GITHUB_ENV"; fi
-      - name: Read at most once a day (an upload on the same day reuses last night's programmes)
-        id: once
-        run: |
-          if [ -f _ingest/.read_at ] && [ $(( $(date +%s) - $(cat _ingest/.read_at 2>/dev/null || echo 0) )) -lt 72000 ]; then echo "read=no" >> "$GITHUB_OUTPUT"; echo "::notice::Programmes were read less than 20 hours ago; reusing them (one read a day at most)."; else echo "read=yes" >> "$GITHUB_OUTPUT"; fi
-      - name: Read venue programmes (capped, polite, facts only)
-        if: steps.once.outputs.read == 'yes'
-        continue-on-error: true
+          key: tixterex-read-only-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            tixterex-ingest-v2-
+            ingest-
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Build the tested source and preserve last-good collected data
         env:
-          INGEST_TM_KEY: ${{ secrets.TM_KEY }}
-          INGEST_SEOUL_KEY: ${{ secrets.SEOUL_KEY }}
-          INGEST_SEATGEEK_ID: ${{ secrets.SEATGEEK_ID }}
-          INGEST_CONTRIB_TOKEN: ${{ env.CONTRIB_TOKEN }}
-          INGEST_CONTRIB_URL: https://api.${{ env.TF_DOMAIN }}/api/contrib/pending
-        run: node tools/ingest.mjs --out _ingest --cities tools/ingest_cities.json --optout "$SRC/data/optout.json" --partners "$SRC/data/partners.json" --max-requests 3000 --max-minutes 20 && mkdir -p _ingest && date +%s > _ingest/.read_at
-      - name: Choose the host
-        id: where
+          PAGE_BASE: ${{ steps.pages.outputs.base_path }}
+          PAGE_URL: ${{ steps.pages.outputs.base_url }}
         run: |
-          CF=off; if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then if [ -f tools/cloudflare/GO_LIVE ]; then CF=live; else CF=preview; fi; fi
-          echo "cf=$CF" >> "$GITHUB_OUTPUT"; if [ "$CF" = live ]; then echo "target=cloudflare" >> "$GITHUB_OUTPUT"; else echo "target=github" >> "$GITHUB_OUTPUT"; fi
-          echo "Cloudflare: $CF"
-      - name: Assemble the website
-        env:
-          TARGET: ${{ steps.where.outputs.target }}
-          CF: ${{ steps.where.outputs.cf }}
-          SITE_DOMAIN: ${{ vars.SITE_DOMAIN }}
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          OWNER: ${{ github.repository_owner }}
-          AFFILIATES: ${{ vars.AFFILIATES }}
-        run: |
-          mkdir -p _site _ingest
-          rsync -a --exclude '.git' --exclude '.github' --exclude '_site' --exclude '_ingest' --exclude 'tools' --exclude 'node_modules' --exclude '*.zip' "$SRC"/ _site/
-          mkdir -p _site/data/ingest && cp -r _ingest/. _site/data/ingest/
-          # every deploy gets its own build id, so open pages and the offline copy update themselves to the latest version
-          BUILD="$(date -u +%Y%m%d%H%M)-${GITHUB_RUN_ID}"
-          sed -i "s/__TF_BUILD__/$BUILD/g" _site/index.html _site/sw.js
-          printf '{"build":"%s"}' "$BUILD" > _site/version.json
-          if [ "$TARGET" = cloudflare ]; then sed -i 's#<meta name="tf-build"#<meta name="tf-contrib" content="on"><meta name="tf-build"#' _site/index.html; fi
-          # A79 partner programmes (repository variable AFFILIATES, e.g. {"ticketmaster.ch":"https://…/c/1/2/3?u={url}","seatgeek.com":"aid=123"}):
-          # checked here, then stamped into the page; links to those shops go through the programme and are marked sponsored
-          node -e 'const a=process.env.AFFILIATES||"";let j;try{j=JSON.parse(a)}catch(_){process.exit(0)}if(!j||typeof j!=="object"||Array.isArray(j))process.exit(0);const o={};for(const[k,v]of Object.entries(j)){if(!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(k)||typeof v!=="string")continue;if(/^https:\/\/[^\s"<>]+\{url\}[^\s"<>]*$/.test(v)||/^[\w-]{1,32}=[\w.-]{1,64}(&[\w-]{1,32}=[\w.-]{1,64})*$/.test(v))o[k.toLowerCase()]=v}if(!Object.keys(o).length)process.exit(0);const fs=require("fs"),f="_site/index.html",esc=JSON.stringify(o).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace("<meta name=\"tf-build\"","<meta name=\"tf-aff\" content=\""+esc+"\"><meta name=\"tf-build\""));console.log("Partner programmes on: "+Object.keys(o).join(", "))' || echo "::warning::AFFILIATES not applied"
-          # A71 alerts: the public half of the signing key (derived from the Cloudflare token; the private half never leaves this run)
-          if [ "$TARGET" = cloudflare ]; then K=$(node -e 'import("./tools/lib/push.mjs").then(m=>process.stdout.write(m.vapidFrom(process.env.CLOUDFLARE_API_TOKEN).publicKey)).catch(()=>{})' || true); if [ -n "$K" ]; then sed -i "s#<meta name=\"tf-build\"#<meta name=\"tf-push-key\" content=\"$K\"><meta name=\"tf-build\"#" _site/index.html; else echo "::warning::alerts key not derived (alerts stay off)"; fi; fi
-          # crawlable town pages with what is on in the next two weeks, and a sitemap that only moves when a page really changed
-          if [ -f _site/data/ingest/index.json ]; then node tools/town_pages.mjs --ingest _site/data/ingest --site _site; fi
-          [ -f _ingest/sitemap_state.json ] || cp tools/sitemap_state.json _ingest/sitemap_state.json 2>/dev/null || true
-          python3 tools/sitemap.py _site --state _ingest/sitemap_state.json
-          SIZE=$(du -sm _site | cut -f1); FILES=$(find _site -type f | wc -l); BIG=$(find _site -type f -size +24M | wc -l)
-          echo "Site: ${SIZE} MB, ${FILES} files, ${BIG} files over 24 MB"
-          test "$SIZE" -lt 900 && test "$FILES" -lt 19000 && test "$BIG" -eq 0
-          # the Cloudflare copy is taken before any github.io link rewrite, and checked by the public-output gate
-          # (GitHub-only builds never depend on it: without Cloudflare the gate only reports)
-          if [ "$CF" != off ]; then rm -rf _site_cf && cp -a _site _site_cf && node tools/cf_budget.mjs _site_cf; else node tools/cf_budget.mjs _site || echo "::warning::public-output gate found items (GitHub-only build continues)"; fi
-          # served from https://<owner>.github.io/<repo>/ until a custom domain is set: make root links point inside the repo path
-          # A77: the custom domain set under Settings → Pages is read here, so tixterex.com works without any extra setting
-          if [ -z "$SITE_DOMAIN" ]; then SITE_DOMAIN=$(GH_TOKEN="$GH_TOKEN" gh api "repos/$REPO/pages" --jq '.cname // empty' 2>/dev/null || true); fi
-          if ! printf '%s' "$SITE_DOMAIN" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then SITE_DOMAIN=""; fi   # only a real host name counts (an error message never does)
-          if [ -n "$SITE_DOMAIN" ]; then echo "Custom domain: $SITE_DOMAIN"; fi
-          OWNER_LC=$(echo "$OWNER" | tr 'A-Z' 'a-z'); NAME="${REPO#*/}"; NAME_LC=$(echo "$NAME" | tr 'A-Z' 'a-z')
-          if [ "$TARGET" = github ] && [ -z "$SITE_DOMAIN" ] && [ "$NAME_LC" != "$OWNER_LC.github.io" ]; then
-            find _site -type f \( -name '*.html' -o -name '*.webmanifest' \) ! -path '_site/index.html' -print0 | xargs -0 sed -i -E "s#((href|src|action)=\"|\"(src|start_url)\": *\")/([^/\"]|\")#\1/$NAME/\4#g"
-            # the app page itself: only its own page links (its scripts contain example paths that must stay as they are)
-            sed -i -E "s#(href|src)=\"/(legal\.html|coverage\.html|venues\.html|about\.html|terms\.html|events/|favicon|apple-touch|icon-|site\.webmanifest|og\.png)#\1=\"/$NAME/\2#g" _site/index.html
-            echo "Links rewritten for https://$OWNER_LC.github.io/$NAME/"
+          set -euo pipefail
+          mkdir -p _reports
+          if [ -f "$TF_INPUT/src/manifest.json" ]; then
+            python3 "$TF_INPUT/tools/build_site.py" --root "$TF_INPUT" --check
           fi
-      - name: Keep tonight's programmes for tomorrow
+          BUILD="r92-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 "$TF_INPUT/tools/release/assemble.py" --input "$TF_INPUT" --output _site --cache _ingest --build "$BUILD" --base-path "${PAGE_BASE:-/}" --site-url "$PAGE_URL" > _reports/assembly.json
+          python3 "$TF_INPUT/tools/recovery/readiness_gate.py" _site --mode package --output _reports/package-health.json
+          python3 "$TF_INPUT/tools/release/check_package.py" _site --output _reports/package-tests.json
+          node "$TF_INPUT/tools/cf_budget.mjs" _site --json > _reports/public-output.json
+          cp _site/supply-health.json _reports/
+          python3 - <<'PY'
+          import json,os
+          h=json.load(open('_reports/supply-health.json'))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('\n## Package and event supply are separate\n')
+              f.write('Package validation passed. No collection was executed by this deployment.\n\n')
+              f.write(f"Collected city files: **{h['cities']}**. Stored occurrences: **{h['occurrences']}**. Future/ongoing stored occurrences: **{h['futureOrOngoingOccurrences']}**.\n\n")
+              f.write('Global 100/75 recall: **not measured**.\n')
+              if not h['futureOrOngoingOccurrences']:
+                  f.write('\n**EVENT SUPPLY NOT READY.** The UI repair can deploy, but the available collected inventory is empty for future dates. Inspect supply-health.json. Browser feeds are independent and are not certified by this job.\n')
+          PY
+      - name: Retain package and supply diagnostics
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/upload-artifact@v4
         with:
-          path: _ingest
-          key: ingest-${{ github.run_id }}
-      - name: Deploy to Cloudflare (preview until GO_LIVE; website assets-only, zero extra cost)
-        if: steps.where.outputs.cf != 'off'
-        continue-on-error: ${{ steps.where.outputs.cf == 'preview' }}
-        working-directory: tools/cloudflare
-        env:
-          CF: ${{ steps.where.outputs.cf }}
-        run: |
-          W="npx --yes wrangler@4.160.0"
-          # the website: static files only — no script, so no request of any kind is ever billed
-          node -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync("wrangler.jsonc","utf8").replace(/^\s*\/\/.*$/mg,""));if(process.argv[1]!=="live"){delete c.routes;c.workers_dev=true;}fs.writeFileSync("wrangler.json",JSON.stringify(c,null,1))' "$CF"
-          # go-live only: free the two web hostnames from the old GitHub Pages records right before the website attaches to them
-          if [ "$CF" = live ]; then node guard.mjs dnsclear || true; fi
-          $W deploy --config wrangler.json
-          [ "$CF" = live ] || exit 0
-          # the suggestion box (api.tixterex.com): reachable only while the account is below 70% of its included script
-          # requests; otherwise it is deployed WITHOUT any address, so no request can reach it (nothing can be billed)
-          APIS=$(node guard.mjs usage || echo off)
-          cd api
-          find_id() { $W d1 list --json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s).find(d=>d.name==="tixterex-contrib");process.stdout.write(x?x.uuid:"")}catch(_){}})'; }
-          ID=$(find_id); if [ -z "$ID" ]; then $W d1 create tixterex-contrib >/dev/null; ID=$(find_id); fi
-          test -n "$ID"
-          # A72: the private event feed for the alert run, built from tonight's programmes (never published on the website)
-          node ../../alerts_feed.mjs ../../../_site/data/ingest feed/upcoming.json || echo '{"rows":[]}' > feed/upcoming.json
-          node -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync("wrangler.jsonc","utf8").replace(/^\s*\/\/.*$/mg,""));c.d1_databases[0].database_id=process.argv[1];if(process.argv[2]!=="on"){delete c.routes;c.workers_dev=false;c.preview_urls=false;c.triggers={crons:[]};}fs.writeFileSync("wrangler.json",JSON.stringify(c,null,1))' "$ID" "$APIS"
-          $W d1 execute tixterex-contrib --remote --yes --config wrangler.json --file ../schema.sql
-          $W deploy --config wrangler.json
-          if [ "$APIS" != on ]; then echo "Suggestion box unreachable this month (zero extra cost)"; exit 0; fi
-          printf '%s' "$CONTRIB_TOKEN" | $W secret put CONTRIB_TOKEN --config wrangler.json
-          node ../guard.mjs ratelimit || true
-          # A72 alerts: the signing key goes into the script's encrypted secret store (the alerts are sent by the script's
-          # own hourly schedule on Cloudflare — nothing that talks to visitors' phones runs on GitHub)
-          node -e 'import("../../lib/push.mjs").then(m=>process.stdout.write(JSON.stringify(m.vapidFrom(process.env.CLOUDFLARE_API_TOKEN).jwk)))' | $W secret put VAPID_JWK --config wrangler.json || echo "::warning::alerts key not stored (alerts pause, nothing else affected)"
-      - uses: actions/upload-pages-artifact@v3
-        if: steps.where.outputs.target == 'github'
+          name: tixterex-health-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _reports/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload only the public website
+        uses: actions/upload-pages-artifact@v4
         with:
           path: _site
   deploy:
     needs: build
-    if: needs.build.outputs.target == 'github'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
+      - name: Deploy validated artifact
+        id: deployment
         uses: actions/deploy-pages@v4
-  # A70 (owner, 21 Nov 2026): keep the repository tidy after every good update — nothing here touches the website files.
-  #  · releases: the newest 3 stay (the live one and two to go back to); older ones and their tags are removed
-  #  · workflow runs: the newest 60 stay;  · caches: the newest 2 nightly-state caches stay
-  tidy:
-    needs: [build, deploy]
-    if: ${{ always() && needs.build.result == 'success' && needs.deploy.result != 'failure' && needs.deploy.result != 'cancelled' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-      actions: write
-    steps:
-      - name: Tidy releases, old runs and caches
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh release list -R "$REPO" --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' | while read -r t; do
-            [ -n "$t" ] && gh release delete "$t" -R "$REPO" --cleanup-tag -y && echo "removed release $t" || true; done
-          gh api "repos/$REPO/actions/runs?per_page=100" --jq '.workflow_runs | sort_by(.created_at) | reverse | .[60:] | .[].id' | while read -r id; do
-            [ -n "$id" ] && gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null && echo "removed run $id" || true; done
-          gh api "repos/$REPO/actions/caches?per_page=100" --jq '.actions_caches | sort_by(.created_at) | reverse | .[2:] | .[].id' | while read -r id; do
-            [ -n "$id" ] && gh api -X DELETE "repos/$REPO/actions/caches/$id" >/dev/null && echo "removed cache $id" || true; done
-          echo "Repository tidy."
+# No automatic release/cache deletion, DNS changes, API provisioning or host migration.
