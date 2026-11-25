@@ -1,6 +1,7 @@
-# R97: replace same-name ZIPs in Code. No release/tag work. No publisher crawling.
-name: TixTerex validate and deploy
-run-name: TixTerex quality gate R97 | ${{ github.event_name }} | ${{ github.ref_name }}
+# TIXTEREX_DEPLOY_CONTRACT: r98
+# Overwrite Code ZIPs. Preserve application visuals. Retire only identified duplicate TixTerex publishers.
+name: TixTerex deployment
+run-name: TixTerex R98 | ${{ github.event_name }} | ${{ github.ref_name }}
 'on':
   push:
     branches:
@@ -33,16 +34,13 @@ run-name: TixTerex quality gate R97 | ${{ github.event_name }} | ${{ github.ref_
         default: ''
 permissions:
   contents: read
-concurrency:
-  group: tixterex-pages
-  cancel-in-progress: false
 defaults:
   run:
     shell: bash
 jobs:
   route:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     permissions:
       contents: read
       actions: write
@@ -56,18 +54,203 @@ jobs:
         EVENT: ${{ github.event_name }}
         WF: ${{ github.workflow_ref }}
         TAG: ${{ github.event.release.tag_name }}
-      run: |
+      run: |-
         set -euo pipefail
+        mkdir -p _reports
         if [ "$EVENT" = release ]; then
           F=$(basename "${WF%@*}")
           B=$(gh api "repos/$REPO" --jq .default_branch)
           gh workflow run "$F" --repo "$REPO" --ref "$B" -f source=release -f "release_tag=$TAG"
           echo 'build_here=false' >> "$GITHUB_OUTPUT"
-          printf 'Release %s handed to %s with its exact tag.
-        ' "$TAG" "$B" >> "$GITHUB_STEP_SUMMARY"
-        else
-          echo 'build_here=true' >> "$GITHUB_OUTPUT"
+          printf 'Release %s handed to %s with its exact tag.\n' "$TAG" "$B" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
         fi
+        python3 - <<'PY_GUARD'
+        #!/usr/bin/env python3
+        """Elect one TixTerex publisher and retire only identifiable older duplicates.
+
+        Executed by the owner's uploaded workflow with Actions write permission. Does not
+        edit source, delete workflows, touch other projects, or contact event publishers.
+        """
+        from __future__ import annotations
+        import base64
+        import json
+        import os
+        import re
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path, PurePosixPath
+        from urllib.parse import quote
+
+        REVISION = 98
+        MARKER = re.compile(r'^# TIXTEREX_DEPLOY_CONTRACT: r(\d+)\s*$', re.M)
+        LEGACY_NAMES = {'TixTerex validate and deploy', 'TixTerex nightly programmes and deploy'}
+        TERMINAL = {'completed'}
+
+        class GuardError(RuntimeError):
+            pass
+
+        def gh_api(method, endpoint):
+            args = ['gh', 'api', '--method', method, endpoint, '-H', 'Accept: application/vnd.github+json']
+            r = subprocess.run(args, capture_output=True, text=True, timeout=45)
+            if r.returncode:
+                detail = r.stderr.strip()[:600]
+                raise GuardError(f'GitHub {method} {endpoint}: {detail}')
+            return json.loads(r.stdout) if r.stdout.strip() else None
+
+        class Guard:
+            def __init__(self, api, repo, run_id, *, sleep=time.sleep, polls=20):
+                if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
+                    raise GuardError('Invalid repository.')
+                self.api, self.repo, self.run_id = api, repo, int(run_id)
+                self.sleep, self.polls = sleep, polls
+                self.report = {'revision':'r98', 'status':'checking', 'publish':False,
+                               'disabledDuplicates':[], 'cancelledRuns':[], 'untouched':[], 'errors':[]}
+
+            def call(self, method, suffix):
+                return self.api(method, f'repos/{self.repo}/{suffix}')
+
+            def pages(self, endpoint, key):
+                rows = []
+                for page in range(1, 11):
+                    sep = '&' if '?' in endpoint else '?'
+                    data = self.call('GET', f'{endpoint}{sep}per_page=100&page={page}')
+                    batch = data.get(key, [])
+                    if not isinstance(batch, list):
+                        raise GuardError('Unexpected GitHub list response.')
+                    rows.extend(batch)
+                    if len(batch) < 100:
+                        return rows
+                raise GuardError('Too many workflows or runs for safe automatic coordination.')
+
+            def source(self, path, sha):
+                p = PurePosixPath(path)
+                if len(p.parts) != 3 or p.parts[:2] != ('.github','workflows') or p.suffix not in {'.yml','.yaml'}:
+                    raise GuardError('Unexpected workflow path: '+path)
+                data = self.call('GET', 'contents/'+quote(path, safe='/')+'?ref='+quote(sha,safe=''))
+                if data.get('type') != 'file' or data.get('encoding') != 'base64':
+                    raise GuardError('Workflow content cannot be safely identified: '+path)
+                body = base64.b64decode(data.get('content',''), validate=False)
+                if len(body)>200000:
+                    raise GuardError('Workflow exceeds inspection size limit.')
+                return body.decode('utf-8')
+
+            def current_head(self, branch):
+                return self.call('GET','git/ref/heads/'+quote(branch,safe=''))['object']['sha']
+
+            @staticmethod
+            def recognized(workflow, text):
+                # Require both a known product identity and a real Pages deploy action.
+                title_ok = workflow.get('name') in LEGACY_NAMES or workflow.get('name') == 'TixTerex deployment'
+                return title_ok and 'TixTerex' in text and bool(re.search(r'uses:\s*actions/deploy-pages@',text))
+
+            def live_runs(self, workflow):
+                # Query all nonterminal statuses in one bounded list, so queued/waiting runs are not missed.
+                return [r for r in self.pages(f'actions/workflows/{int(workflow)}/runs', 'workflow_runs')
+                        if r.get('status') not in TERMINAL and int(r.get('id',0)) != self.run_id]
+
+            def run(self):
+                me = self.call('GET',f'actions/runs/{self.run_id}')
+                branch, sha = me.get('head_branch',''), me.get('head_sha','')
+                if me.get('event') not in {'push','workflow_dispatch'} or not branch or not re.fullmatch(r'[a-f0-9]{40,64}',sha):
+                    raise GuardError('Only a branch push or explicit dispatch can publish.')
+                self.report.update(branch=branch, headSha=sha, runId=self.run_id)
+                if self.current_head(branch) != sha:
+                    self.report['status']='superseded';return self.report
+                current_id = int(me['workflow_id'])
+                workflows = self.pages('actions/workflows','workflows')
+                me_wf = next((w for w in workflows if int(w['id'])==current_id), None)
+                if me_wf is None:
+                    raise GuardError('Current workflow is not in the repository workflow list.')
+                current_text = self.source(me_wf['path'],sha)
+                marker = MARKER.search(current_text)
+                if not marker or int(marker[1]) != REVISION:
+                    raise GuardError('Current workflow is not the R98 repair; no workflow was disabled.')
+                candidates=[]; identified=[]
+                for w in workflows:
+                    if w.get('state') != 'active' or w.get('name') not in LEGACY_NAMES|{'TixTerex deployment'}:
+                        self.report['untouched'].append({'id':w['id'],'path':w.get('path'),'reason':'inactive or other workflow'})
+                        continue
+                    text = current_text if int(w['id'])==current_id else self.source(w['path'],sha)
+                    if not self.recognized(w,text):
+                        self.report['untouched'].append({'id':w['id'],'path':w.get('path'),'reason':'not an identified TixTerex Pages publisher'})
+                        continue
+                    identified.append(w)
+                    m=MARKER.search(text)
+                    if m:candidates.append((int(m[1]),w))
+                if not candidates:
+                    raise GuardError('No recognized repair workflow found.')
+                newest=max(rev for rev,w in candidates)
+                finalists=[w for rev,w in candidates if rev==newest]
+                winner=sorted(finalists,key=lambda w:(w['path']!='.github/workflows/tixterex.yml',w['path']!='.github/workflows/tixterex.yaml',w['path']))[0]
+                self.report['canonicalPath']=winner['path']
+                if int(winner['id'])!=current_id:
+                    self.report['status']='duplicate_skipped';return self.report
+                own_runs=[r for r in self.live_runs(current_id) if r.get('head_branch')==branch]
+                if any(int(r['id'])>self.run_id and r.get('head_sha')==sha for r in own_runs):
+                    self.report['status']='superseded_run';return self.report
+                targets=[w for w in identified if int(w['id'])!=current_id]
+                for w in targets:
+                    # Reversible API disable, no workflow file deletion or repository write.
+                    self.call('PUT',f"actions/workflows/{int(w['id'])}/disable")
+                    self.report['disabledDuplicates'].append({'id':w['id'],'path':w['path']})
+                cancelled=set()
+                for attempt in range(self.polls):
+                    pending=[]
+                    for w in targets+[winner]:
+                        active=self.live_runs(w['id'])
+                        if int(w['id'])==current_id:
+                            active=[r for r in active if r.get('head_branch')==branch and int(r['id'])<self.run_id]
+                        for r in active:
+                            rid=int(r['id']);pending.append(rid)
+                            if rid not in cancelled:
+                                try:self.call('POST',f'actions/runs/{rid}/cancel')
+                                except GuardError:
+                                    # Completion can race the cancellation call. Re-read before failing.
+                                    if self.call('GET',f'actions/runs/{rid}').get('status')!='completed':raise
+                                cancelled.add(rid);self.report['cancelledRuns'].append(rid)
+                    if not pending:break
+                    if attempt==self.polls-1:
+                        raise GuardError('An older publisher has not stopped. The current live site was not replaced.')
+                    self.sleep(2)
+                if self.current_head(branch)!=sha:
+                    self.report['status']='superseded';return self.report
+                self.report.update(status='single_publisher',publish=True)
+                return self.report
+
+        def main():
+            report_path=Path('_reports/workflow-coordination.json');report_path.parent.mkdir(exist_ok=True)
+            guard=None;code=0
+            try:
+                guard=Guard(gh_api,os.environ['GITHUB_REPOSITORY'],os.environ['GITHUB_RUN_ID'])
+                report=guard.run()
+            except Exception as exc:
+                report=guard.report if guard else {'revision':'r98','publish':False}
+                report.update(status='blocked',publish=False);report.setdefault('errors',[]).append(str(exc));code=1
+                print('::error::'+str(exc).replace('%','%25').replace('\n','%0A').replace('\r','%0D'),file=sys.stderr)
+            report_path.write_text(json.dumps(report,indent=2)+'\n')
+            with open(os.environ.get('GITHUB_OUTPUT',os.devnull),'a') as f:f.write('publish='+str(bool(report.get('publish'))).lower()+'\n')
+            with open(os.environ.get('GITHUB_STEP_SUMMARY',os.devnull),'a') as f:
+                f.write('\n## Deployment coordination\n\n```json\n'+json.dumps(report,indent=2)+'\n```\n')
+            print(json.dumps(report,indent=2));return code
+        if __name__=='__main__':sys.exit(main())
+
+        PY_GUARD
+        python3 - <<'PY_ROUTE'
+        import json,os
+        r=json.load(open('_reports/workflow-coordination.json'))
+        with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+            f.write('build_here='+str(bool(r.get('publish'))).lower()+'\n')
+        PY_ROUTE
+    - name: Keep workflow coordination evidence
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: tixterex-coordination-${{ github.run_id }}-${{ github.run_attempt }}
+        path: _reports/
+        if-no-files-found: ignore
+        retention-days: 14
   build:
     needs: route
     if: needs.route.outputs.build_here == 'true'
@@ -96,7 +279,7 @@ jobs:
         INPUT_SOURCE: ${{ inputs.source }}
         CONFIG_SOURCE: ${{ vars.TIXTEREX_ARTIFACT_SOURCE }}
         RELEASE_TAG: ${{ inputs.release_tag }}
-      run: |
+      run: |-
         set -euo pipefail
         mkdir -p _reports
         python3 - <<'PY_RESOLVE'
@@ -177,9 +360,9 @@ jobs:
         class Resolver:
             def __init__(self, work, releases, fetch_asset, pinned='', source='auto', release_loader=None):
                 self.work = Path(work).resolve()
-                self.staging = self.work / '_r97_downloads'
+                self.staging = self.work / '_r98_downloads'
                 self.staging.mkdir(exist_ok=True)
-                self.output = self.work / '_r97_package' / 'tixterex'
+                self.output = self.work / '_r98_package' / 'tixterex'
                 self.releases = [r for r in releases if not r.get('draft') and (pinned or not r.get('prerelease'))]
                 self.releases.sort(key=lambda r: (r.get('published_at') or '', r.get('created_at') or ''), reverse=True)
                 self.fetch_asset = fetch_asset
@@ -192,7 +375,7 @@ jobs:
                 self.total_bytes = 0
                 self.expanded_bytes = 0
                 self.report = {'schema': 'tixterex-workflow-resolution/1', 'status': 'checking',
-                               'workflowRevision': 'r97', 'workflowPatch': 'deterministic-upload-selection', 'assetsSeen': [], 'warnings': [], 'placeParts': [], 'ignoredApplications': []}
+                               'workflowRevision': 'r98', 'workflowPatch': 'deterministic-upload-selection', 'assetsSeen': [], 'warnings': [], 'placeParts': [], 'ignoredApplications': []}
 
             def inspect(self, path, label, depth=0):
                 path = Path(path)
@@ -333,22 +516,35 @@ jobs:
                 self.releases.sort(key=lambda r: (r.get('published_at') or '', r.get('created_at') or ''), reverse=True)
 
             def local_application(self):
-                # The file the owner overwrites is authoritative. Never consult old releases
-                # when this package is present; never silently fall back from a corrupt replacement.
-                for relative in ['tixterex-release.zip', 'uploads/tixterex-release.zip']:
-                    path = self.work / relative
-                    if path.is_file():
+                # Browser download suffixes are application uploads, not unrelated backups.
+                # Compare embedded revisions inside this narrow filename family. Never mix.
+                pattern = re.compile(r'^tixterex-release(?:(?:\s*\(\d+\))|(?:[.\-]\d+))?\.zip$', re.I)
+                candidates=[]; seen=[]
+                for folder in [self.work,self.work/'uploads']:
+                    if not folder.is_dir():
+                        continue
+                    for path in sorted(folder.iterdir()):
+                        if not path.is_file() or not pattern.fullmatch(path.name):
+                            continue
                         if path.is_symlink():
                             raise ResolveError('The replacement ZIP must not be a symbolic link.')
-                        candidate = self.choose(self.inspect(path, 'repository: ' + relative)['apps'])
-                        if candidate is None:
-                            raise ResolveError(relative + ' does not contain the repaired TixTerex application and build tools.')
-                        self.report['selectionPolicy'] = 'exact replacement ZIP in Code; old Releases and backup applications ignored'
-                        return candidate
+                        label='repository: '+str(path.relative_to(self.work))
+                        ref=self.inspect(path,label)
+                        seen.append(label)
+                        candidates.extend(ref['apps'])
+                        if not ref['apps']:
+                            self.report['warnings'].append('Unqualified older upload: '+label)
+                if seen:
+                    if not candidates:
+                        raise ResolveError('tixterex-release.zip does not contain the repaired TixTerex application and build tools.')
+                    candidate=self.choose(candidates)
+                    self.report['selectionPolicy']='newest embedded revision in the same-name application upload family; unrelated backup ZIPs and old Releases ignored'
+                    self.report['applicationUploadsSeen']=seen
+                    return candidate
                 apps = [a for archive in self.local_archives() for a in archive['apps']]
                 candidate = self.choose(apps)
                 if candidate:
-                    self.report['selectionPolicy'] = 'newest embedded application revision among Code ZIPs; no cross-version merge'
+                    self.report['selectionPolicy']='newest embedded application revision among Code ZIPs; no cross-version merge'
                 return candidate
 
             def choose(self, apps):
@@ -462,7 +658,7 @@ jobs:
                     if self.output.parent.exists():
                         shutil.rmtree(self.output.parent)
                     self.output.mkdir(parents=True)
-                    for name in ['site', 'tools', 'src']:
+                    for name in ['site', 'tools', 'src', 'qa', 'benchmark']:
                         if (root/name).is_dir():
                             shutil.copytree(root/name, self.output/name)
                     if not self.places_complete():
@@ -608,6 +804,22 @@ jobs:
                 raise SystemExit(1)
 
         PY_RESOLVE
+    - name: Check replacement package includes its tests
+      run: |-
+        set -euo pipefail
+        python3 - <<'PY_CONTRACT'
+        import os,json
+        from pathlib import Path
+        root=Path(os.environ['TF_INPUT'])
+        required=['tools/build_site.py','tools/release/assemble.py','tools/quality/browser_gate.py',
+                  'tools/release/workflow_guard.py','qa/r97/test_inventory.py','qa/r97/test_ingest.mjs',
+                  'qa/r97/test_calendar.mjs','qa/r98/test_workflow_guard.py']
+        missing=[x for x in required if not (root/x).is_file()]
+        report={'complete':not missing,'missing':missing}
+        Path('_reports/package-contract.json').write_text(json.dumps(report,indent=2)+'\n')
+        if missing:
+            raise SystemExit('The application ZIP is incomplete or older than this workflow. Replace the existing top-level tixterex-release.zip with the supplied R98 file. Missing: '+', '.join(missing))
+        PY_CONTRACT
     - name: Restore existing collection data without running a crawler
       uses: actions/cache/restore@v5
       with:
@@ -630,7 +842,7 @@ jobs:
         if [ -f "$TF_INPUT/src/manifest.json" ]; then
           python3 "$TF_INPUT/tools/build_site.py" --root "$TF_INPUT" --check
         fi
-        BUILD="r97-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        BUILD="r98-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
         export BUILD
         python3 "$TF_INPUT/tools/release/assemble.py" --input "$TF_INPUT" --output _site --cache _ingest --build "$BUILD" --base-path "${PAGE_BASE:-/}" --site-url "$PAGE_URL" > _reports/assembly.json
         python3 "$TF_INPUT/tools/recovery/readiness_gate.py" _site --mode package --output _reports/package-health.json
@@ -644,7 +856,7 @@ jobs:
         selection = json.loads(Path('_reports/download-report.json').read_text())
         info_path = Path('_site/release-info.json')
         info = json.loads(info_path.read_text())
-        info.update(workflowRevision='r97', workflowPatch='upload-first-source-safe', applicationRelease=selection.get('applicationRelease'), releaseTag=selection.get('releaseTag'), artifactSha256=selection.get('applicationSha256'))
+        info.update(workflowRevision='r98', workflowPatch='single-publisher-preserve-site', applicationRelease=selection.get('applicationRelease'), releaseTag=selection.get('releaseTag'), artifactSha256=selection.get('applicationSha256'))
         info_path.write_text(json.dumps(info, indent=2)+'\n')
         Path('_reports/deployment-expected.json').write_text(json.dumps(info, indent=2)+'\n')
         with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
@@ -660,19 +872,14 @@ jobs:
                 f.write('\n**EVENT SUPPLY NOT READY.** Publishing a UI repair does not establish event coverage.\n')
         PY_SUMMARY
     - name: Check event preservation and calendar exports
-      run: |
+      run: |-
         set -euo pipefail
         python3 "$TF_INPUT/qa/r97/test_inventory.py"
         node "$TF_INPUT/qa/r97/test_ingest.mjs" _reports/ingest-tests.json
         node "$TF_INPUT/qa/r97/test_calendar.mjs" "$TF_INPUT/tools/ingest.mjs" _reports/calendar-tests.json
-    - name: Keep diagnostic reports even after a failure
-      if: ${{ always() }}
-      uses: actions/upload-artifact@v7
-      with:
-        name: tixterex-health-${{ github.run_id }}-${{ github.run_attempt }}
-        path: _reports/
-        if-no-files-found: ignore
-        retention-days: 14
+
+        python3 "$TF_INPUT/qa/r98/test_workflow_guard.py"
+        python3 "$TF_INPUT/qa/r97/test_resolver.py"
     - name: Install pinned browser test runtime
       run: |
         set -euo pipefail
@@ -682,10 +889,11 @@ jobs:
     - name: Test the built website before publishing
       env:
         PAGE_BASE: ${{ steps.pages.outputs.base_path }}
-      run: |
+      run: |-
         set -euo pipefail
-        test -f "$TF_INPUT/tools/quality/browser_gate.py" || { echo "::error::The R97 application ZIP is missing. Upload the supplied tixterex-release.zip in Code."; exit 1; }
-        "$RUNNER_TEMP/tixterex-qa/bin/python" "$TF_INPUT/tools/quality/browser_gate.py" --site _site --base-path "${PAGE_BASE:-/}" --output _reports/browser
+        for WIDTH in 320 390 430 768 1440; do
+          timeout 150s "$RUNNER_TEMP/tixterex-qa/bin/python" "$TF_INPUT/tools/quality/browser_gate.py" --site _site --base-path "${PAGE_BASE:-/}" --widths "$WIDTH" --output "_reports/browser/$WIDTH"
+        done
     - name: Keep browser acceptance evidence
       if: always()
       uses: actions/upload-artifact@v7
@@ -698,6 +906,17 @@ jobs:
       uses: actions/upload-pages-artifact@v5
       with:
         path: _site
+    - name: Keep all build and test diagnostics
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: tixterex-health-${{ github.run_id }}-${{ github.run_attempt }}
+        path: _reports/
+        if-no-files-found: ignore
+        retention-days: 14
+    concurrency:
+      group: tixterex-r98-build-${{ github.ref }}
+      cancel-in-progress: true
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -705,13 +924,35 @@ jobs:
     permissions:
       pages: write
       id-token: write
+      contents: read
+      actions: read
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+    - name: Do not publish a superseded commit
+      id: fresh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        BRANCH: ${{ github.ref_name }}
+        SHA: ${{ github.sha }}
+      run: |-
+        set -euo pipefail
+        python3 - <<'PY_FRESH'
+        import json,os,subprocess,urllib.parse
+        endpoint='repos/'+os.environ['REPO']+'/git/ref/heads/'+urllib.parse.quote(os.environ['BRANCH'],safe='')
+        r=subprocess.run(['gh','api',endpoint],capture_output=True,text=True,check=True)
+        head=json.loads(r.stdout)['object']['sha']
+        current=head==os.environ['SHA']
+        with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('publish='+str(current).lower()+'\n')
+        if not current:
+            with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write('A newer upload exists. This older build was not published.\n')
+        PY_FRESH
     - name: Deploy the validated website
       id: deployment
       uses: actions/deploy-pages@v5
+      if: ${{ steps.fresh.outputs.publish == 'true' }}
     - name: Verify the public build and actual HTML
       env:
         SITE_URL: ${{ steps.deployment.outputs.page_url }}
@@ -768,6 +1009,7 @@ jobs:
         if not report['verified']:
             raise SystemExit(1)
         PY_VERIFY
+      if: ${{ steps.fresh.outputs.publish == 'true' }}
     - name: Retain live verification evidence
       if: ${{ always() }}
       uses: actions/upload-artifact@v7
@@ -776,3 +1018,6 @@ jobs:
         path: _verify/
         if-no-files-found: ignore
         retention-days: 14
+    concurrency:
+      group: tixterex-pages
+      cancel-in-progress: false
