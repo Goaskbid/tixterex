@@ -1,1128 +1,278 @@
-# TIXTEREX_DEPLOY_CONTRACT: r99
-# Confirmed R98 repair: Playwright 1.57.0 requires a supported OS, not ubuntu-latest.
-# Same-name uploads; the public application, visuals and collected data are unchanged.
-name: TixTerex deployment
-run-name: TixTerex R99 | ${{ github.event_name }} | ${{ github.ref_name }}
-'on':
+# TixTerex — nightly venue programmes + site deploy (A36, owner decision 15 Nov 2026).
+# Built so GitHub has nothing to object to:
+#  · runs once a day (02:17 UTC) and on your own uploads; one job at a time; hard limit 30 minutes;
+#  · the reader stops itself at 3,000 polite requests or 20 minutes, spread over many different websites,
+#    never two requests to the same site closer than 1.5 s, robots.txt honoured, honest User-Agent;
+#  · it commits NOTHING: the programmes go straight into the Pages deploy and are carried to the next
+#    night in the Actions cache, so the repository never grows;
+#  · facts only (title, date, time, place, price, link) from each organiser's own published event data.
+# Hosting (A63, owner instruction 21 Nov 2026 — Cloudflare Workers Paid for all five sites):
+#  · GitHub Pages keeps serving exactly as today. Adding CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID as REPOSITORY
+#    Actions secrets (GitHub Free does not pass organisation secrets to private repositories) only ADDS a Cloudflare
+#    preview on a workers.dev address; nothing switches by itself.
+#  · Zero extra Cloudflare cost: the website is static files only (no script, so no request is ever billed); the
+#    suggestion box is a separate script, deployed only on go-live and only while the account is below 70% of its
+#    included script requests, with a 1.5 million a month cap of its own and a flood rule in front of it.
+#  · The switch is a release that carries tools/cloudflare/GO_LIVE (shipped only after the owner's yes): the site is then
+#    served by Cloudflare on tixterex.com, the suggestion box goes on, and GitHub Pages is no longer deployed.
+name: TixTerex nightly programmes and deploy
+on:
+  schedule:
+    - cron: '17 2 * * *'
   push:
-    branches:
-    - main
-    - master
-    paths:
-    - .github/workflows/**
-    - site/**
-    - src/**
-    - tools/**
-    - '*.zip'
-    - uploads/**
+    branches: [main]
   release:
-    types:
-    - published
+    types: [published]
   workflow_dispatch:
-    inputs:
-      source:
-        description: 'Automatic: replacement ZIPs under Code, otherwise release assets'
-        type: choice
-        options:
-        - auto
-        - uploads
-        - release
-        - repository
-        default: auto
-      release_tag:
-        description: Optional exact release tag; leave blank for automatic selection
-        type: string
-        default: ''
 permissions:
   contents: read
-defaults:
-  run:
-    shell: bash
+  pages: write
+  id-token: write
+concurrency:
+  group: tixterex-pages
+  cancel-in-progress: false
 jobs:
-  route:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  # Two ways to bring the website: its files in the repository, or (simpler) a release with tixterex-release.zip
+  # attached. Until either exists, nothing runs (no red error on the very first upload).
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
     permissions:
       contents: read
       actions: write
     outputs:
-      build_here: ${{ steps.route.outputs.build_here }}
+      ready: ${{ steps.r.outputs.ready }}
     steps:
-    - id: route
-      env:
-        GH_TOKEN: ${{ github.token }}
-        REPO: ${{ github.repository }}
-        EVENT: ${{ github.event_name }}
-        WF: ${{ github.workflow_ref }}
-        TAG: ${{ github.event.release.tag_name }}
-      run: |-
-        set -euo pipefail
-        mkdir -p _reports
-        if [ "$EVENT" = release ]; then
-          F=$(basename "${WF%@*}")
-          B=$(gh api "repos/$REPO" --jq .default_branch)
-          gh workflow run "$F" --repo "$REPO" --ref "$B" -f source=release -f "release_tag=$TAG"
-          echo 'build_here=false' >> "$GITHUB_OUTPUT"
-          printf 'Release %s handed to %s with its exact tag.\n' "$TAG" "$B" >> "$GITHUB_STEP_SUMMARY"
-          exit 0
-        fi
-        python3 - <<'PY_GUARD'
-        #!/usr/bin/env python3
-        """Elect one TixTerex publisher and retire only identifiable older duplicates.
-
-        Executed by the owner's uploaded workflow with Actions write permission. Does not
-        edit source, delete workflows, touch other projects, or contact event publishers.
-        """
-        from __future__ import annotations
-        import base64
-        import json
-        import os
-        import re
-        import subprocess
-        import sys
-        import time
-        from pathlib import Path, PurePosixPath
-        from urllib.parse import quote
-
-        REVISION = 99
-        MARKER = re.compile(r'^# TIXTEREX_DEPLOY_CONTRACT: r(\d+)\s*$', re.M)
-        LEGACY_NAMES = {'TixTerex validate and deploy', 'TixTerex nightly programmes and deploy'}
-        TERMINAL = {'completed'}
-
-        class GuardError(RuntimeError):
-            pass
-
-        def gh_api(method, endpoint):
-            args = ['gh', 'api', '--method', method, endpoint, '-H', 'Accept: application/vnd.github+json']
-            r = subprocess.run(args, capture_output=True, text=True, timeout=45)
-            if r.returncode:
-                detail = r.stderr.strip()[:600]
-                raise GuardError(f'GitHub {method} {endpoint}: {detail}')
-            return json.loads(r.stdout) if r.stdout.strip() else None
-
-        class Guard:
-            def __init__(self, api, repo, run_id, *, sleep=time.sleep, polls=90):
-                if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
-                    raise GuardError('Invalid repository.')
-                self.api, self.repo, self.run_id = api, repo, int(run_id)
-                self.sleep, self.polls = sleep, polls
-                self.report = {'revision':'r99', 'status':'checking', 'publish':False,
-                               'disabledDuplicates':[], 'cancelledRuns':[], 'untouched':[], 'errors':[]}
-
-            def call(self, method, suffix):
-                return self.api(method, f'repos/{self.repo}/{suffix}')
-
-            def pages(self, endpoint, key):
-                rows = []
-                for page in range(1, 11):
-                    sep = '&' if '?' in endpoint else '?'
-                    data = self.call('GET', f'{endpoint}{sep}per_page=100&page={page}')
-                    batch = data.get(key, [])
-                    if not isinstance(batch, list):
-                        raise GuardError('Unexpected GitHub list response.')
-                    rows.extend(batch)
-                    if len(batch) < 100:
-                        return rows
-                raise GuardError('Too many workflows or runs for safe automatic coordination.')
-
-            def source(self, path, sha):
-                p = PurePosixPath(path)
-                if len(p.parts) != 3 or p.parts[:2] != ('.github','workflows') or p.suffix not in {'.yml','.yaml'}:
-                    raise GuardError('Unexpected workflow path: '+path)
-                data = self.call('GET', 'contents/'+quote(path, safe='/')+'?ref='+quote(sha,safe=''))
-                if data.get('type') != 'file' or data.get('encoding') != 'base64':
-                    raise GuardError('Workflow content cannot be safely identified: '+path)
-                body = base64.b64decode(data.get('content',''), validate=False)
-                if len(body)>200000:
-                    raise GuardError('Workflow exceeds inspection size limit.')
-                return body.decode('utf-8')
-
-            def current_head(self, branch):
-                return self.call('GET','git/ref/heads/'+quote(branch,safe=''))['object']['sha']
-
-            @staticmethod
-            def recognized(workflow, text):
-                # Require both a known product identity and a real Pages deploy action.
-                title_ok = workflow.get('name') in LEGACY_NAMES or workflow.get('name') == 'TixTerex deployment'
-                return title_ok and 'TixTerex' in text and bool(re.search(r'uses:\s*actions/deploy-pages@',text))
-
-            def live_runs(self, workflow):
-                # Query all nonterminal statuses in one bounded list, so queued/waiting runs are not missed.
-                return [r for r in self.pages(f'actions/workflows/{int(workflow)}/runs', 'workflow_runs')
-                        if r.get('status') not in TERMINAL and int(r.get('id',0)) != self.run_id]
-
-            def run(self):
-                me = self.call('GET',f'actions/runs/{self.run_id}')
-                branch, sha = me.get('head_branch',''), me.get('head_sha','')
-                if me.get('event') not in {'push','workflow_dispatch'} or not branch or not re.fullmatch(r'[a-f0-9]{40,64}',sha):
-                    raise GuardError('Only a branch push or explicit dispatch can publish.')
-                self.report.update(branch=branch, headSha=sha, runId=self.run_id)
-                if self.current_head(branch) != sha:
-                    self.report['status']='superseded';return self.report
-                current_id = int(me['workflow_id'])
-                workflows = self.pages('actions/workflows','workflows')
-                me_wf = next((w for w in workflows if int(w['id'])==current_id), None)
-                if me_wf is None:
-                    raise GuardError('Current workflow is not in the repository workflow list.')
-                current_text = self.source(me_wf['path'],sha)
-                marker = MARKER.search(current_text)
-                if not marker or int(marker[1]) != REVISION:
-                    raise GuardError('Current workflow is not the R99 repair; no workflow was disabled.')
-                candidates=[]; identified=[]
-                for w in workflows:
-                    if w.get('name') not in LEGACY_NAMES|{'TixTerex deployment'} or w.get('state') not in {'active','disabled_manually','disabled_inactivity'}:
-                        self.report['untouched'].append({'id':w['id'],'path':w.get('path'),'reason':'not a supported TixTerex publisher state or name'})
-                        continue
-                    if w.get('state') != 'active' and not self.live_runs(w['id']):
-                        self.report['untouched'].append({'id':w['id'],'path':w.get('path'),'reason':'disabled and no unfinished runs'})
-                        continue
-                    text = current_text if int(w['id'])==current_id else self.source(w['path'],sha)
-                    if not self.recognized(w,text):
-                        self.report['untouched'].append({'id':w['id'],'path':w.get('path'),'reason':'not an identified TixTerex Pages publisher'})
-                        continue
-                    identified.append(w)
-                    m=MARKER.search(text)
-                    if m and w.get('state')=='active':candidates.append((int(m[1]),w))
-                if not candidates:
-                    raise GuardError('No recognized repair workflow found.')
-                newest=max(rev for rev,w in candidates)
-                finalists=[w for rev,w in candidates if rev==newest]
-                winner=sorted(finalists,key=lambda w:(w['path']!='.github/workflows/tixterex.yml',w['path']!='.github/workflows/tixterex.yaml',w['path']))[0]
-                self.report['canonicalPath']=winner['path']
-                if int(winner['id'])!=current_id:
-                    self.report['status']='duplicate_skipped';return self.report
-                own_runs=[r for r in self.live_runs(current_id) if r.get('head_branch')==branch]
-                if any(int(r['id'])>self.run_id and r.get('head_sha')==sha for r in own_runs):
-                    self.report['status']='superseded_run';return self.report
-                targets=[w for w in identified if int(w['id'])!=current_id]
-                for w in targets:
-                    # Reversible API disable, no workflow file deletion or repository write.
-                    if w.get('state')=='active':
-                        self.call('PUT',f"actions/workflows/{int(w['id'])}/disable")
-                        self.report['disabledDuplicates'].append({'id':w['id'],'path':w['path']})
-                    else:
-                        self.report.setdefault('alreadyDisabledPending',[]).append({'id':w['id'],'path':w['path']})
-                cancelled=set()
-                for attempt in range(self.polls):
-                    pending=[]
-                    for w in targets+[winner]:
-                        active=self.live_runs(w['id'])
-                        if int(w['id'])==current_id:
-                            active=[r for r in active if r.get('head_branch')==branch and int(r['id'])<self.run_id]
-                        for r in active:
-                            rid=int(r['id']);pending.append(rid)
-                            if rid not in cancelled:
-                                try:self.call('POST',f'actions/runs/{rid}/cancel')
-                                except GuardError:
-                                    # Completion can race the cancellation call. Re-read before failing.
-                                    if self.call('GET',f'actions/runs/{rid}').get('status')!='completed':raise
-                                cancelled.add(rid);self.report['cancelledRuns'].append(rid)
-                    if not pending:break
-                    if attempt==self.polls-1:
-                        raise GuardError('An older publisher has not stopped. The current live site was not replaced.')
-                    self.sleep(2)
-                if self.current_head(branch)!=sha:
-                    self.report['status']='superseded';return self.report
-                self.report.update(status='single_publisher',publish=True)
-                return self.report
-
-        def main():
-            report_path=Path('_reports/workflow-coordination.json');report_path.parent.mkdir(exist_ok=True)
-            guard=None;code=0
-            try:
-                guard=Guard(gh_api,os.environ['GITHUB_REPOSITORY'],os.environ['GITHUB_RUN_ID'])
-                report=guard.run()
-            except Exception as exc:
-                report=guard.report if guard else {'revision':'r99','publish':False}
-                report.update(status='blocked',publish=False);report.setdefault('errors',[]).append(str(exc));code=1
-                print('::error::'+str(exc).replace('%','%25').replace('\n','%0A').replace('\r','%0D'),file=sys.stderr)
-            report_path.write_text(json.dumps(report,indent=2)+'\n')
-            with open(os.environ.get('GITHUB_OUTPUT',os.devnull),'a') as f:f.write('publish='+str(bool(report.get('publish'))).lower()+'\n')
-            with open(os.environ.get('GITHUB_STEP_SUMMARY',os.devnull),'a') as f:
-                f.write('\n## Deployment coordination\n\n```json\n'+json.dumps(report,indent=2)+'\n```\n')
-            print(json.dumps(report,indent=2));return code
-        if __name__=='__main__':sys.exit(main())
-        PY_GUARD
-        python3 - <<'PY_ROUTE'
-        import json,os
-        r=json.load(open('_reports/workflow-coordination.json'))
-        with open(os.environ['GITHUB_OUTPUT'],'a') as f:
-            f.write('build_here='+str(bool(r.get('publish'))).lower()+'\n')
-        PY_ROUTE
-      name: Coordinate one publisher and wait for older runs
-    - name: Keep workflow coordination evidence
-      if: ${{ always() }}
-      uses: actions/upload-artifact@v7
-      with:
-        name: tixterex-coordination-${{ github.run_id }}-${{ github.run_attempt }}
-        path: _reports/
-        if-no-files-found: ignore
-        retention-days: 14
+      # GitHub Pages only accepts deploys from the main branch. A published release runs on its tag, so it hands the
+      # work to a run on main (same file, same release zips) instead of deploying itself and being rejected.
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          WF: ${{ github.workflow_ref }}
+        run: |
+          if [ "$EVENT" = "release" ]; then
+            F=$(basename "${WF%@*}")
+            B=$(gh api "repos/$REPO" --jq .default_branch)
+            gh workflow run "$F" --repo "$REPO" --ref "$B"
+            echo "ready=false" >> "$GITHUB_OUTPUT"; echo "::notice::New release: the deploy now runs on $B (see the next run in the list)."; exit 0
+          fi
+          if gh api "repos/$REPO/contents/" --jq '.[].name' 2>/dev/null | grep -q '^tixterex-release.*\.zip$' || gh api "repos/$REPO/contents/site/index.html" >/dev/null 2>&1 || gh release view --repo "$REPO" >/dev/null 2>&1; then echo "ready=true" >> "$GITHUB_OUTPUT"; else echo "ready=false" >> "$GITHUB_OUTPUT"; echo "::notice::Waiting for the website: create a release and attach tixterex-release.zip."; fi
   build:
-    needs: route
-    if: needs.route.outputs.build_here == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
+    needs: check
+    if: needs.check.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     outputs:
-      build: ${{ steps.assemble.outputs.build }}
-      site_sha256: ${{ steps.assemble.outputs.site_sha256 }}
-      ready: ${{ steps.package_contract.outputs.ready }}
+      target: ${{ steps.where.outputs.target }}
     steps:
-    - uses: actions/checkout@v6
-      with:
-        persist-credentials: false
-    - uses: actions/setup-node@v6
-      with:
-        node-version: '22'
-        package-manager-cache: false
-    - name: Use Python 3.12 for the pinned browser tooling
-      id: qa_python
-      uses: actions/setup-python@v6
-      with:
-        python-version: '3.12'
-        check-latest: false
-    - name: Select the overwritten Code ZIP, never mix application versions
-      id: resolve
-      env:
-        GH_TOKEN: ${{ github.token }}
-        REPO: ${{ github.repository }}
-        INPUT_SOURCE: ${{ inputs.source }}
-        CONFIG_SOURCE: ${{ vars.TIXTEREX_ARTIFACT_SOURCE }}
-        RELEASE_TAG: ${{ inputs.release_tag }}
-      run: |-
-        set -euo pipefail
-        mkdir -p _reports
-        python3 - <<'PY_RESOLVE'
-        #!/usr/bin/env python3
-        """Resolve deployable TixTerex archives by content, not an exact asset filename.
-        Code uploads take precedence. Applications are never merged. Older releases may supply hash-identical
-        place archives, never a substitute application. No third-party crawling.
-        """
-        from __future__ import annotations
-        import hashlib
-        import json
-        import os
-        from pathlib import Path, PurePosixPath
-        import re
-        import shutil
-        import stat
-        import subprocess
-        import sys
-        import urllib.parse
-        import zipfile
-
-        MAX_ZIP = 250 * 1024 * 1024
-        MAX_EXPANDED = 900 * 1024 * 1024
-        MAX_TOTAL = 1500 * 1024 * 1024
-        FONT_EXT = {'.woff', '.woff2', '.ttf', '.otf', '.eot'}
-        PART_NAMES = {'tixterex-places-1.zip', 'tixterex-places-2.zip'}
-
-
-        def release_key(value):
-            """Order the embedded application revision, never a download suffix like .2.zip."""
-            text = str(value or '').strip().lower()
-            match = re.match(r'^[ar](\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[^0-9]|$)', text)
-            if not match:
-                return (0, 0, 0, 0)
-            dates = re.findall(r'(?<!\d)(20\d{6}(?:t?\d{4,6})?)(?!\d)', text)
-            stamp = max((int(x.replace('t','').ljust(14,'0')) for x in dates), default=0)
-            return tuple(int(x or 0) for x in match.groups()) + (stamp,)
-
-        def app_identity(z, prefix, names):
-            h=hashlib.sha256()
-            for name in sorted(names):
-                if not name.startswith(prefix) or name.endswith('/'):
-                    continue
-                rel=name[len(prefix):]
-                if not rel.startswith(('site/','src/','tools/')) or rel.startswith(('site/data/localities/','site/data/ingest/')):
-                    continue
-                h.update(rel.encode());h.update(b'\0');h.update(hashlib.sha256(z.read(name)).digest())
-            return h.hexdigest()
-
-        class ResolveError(RuntimeError):
-            pass
-
-        def digest(path):
-            h = hashlib.sha256()
-            with open(path, 'rb') as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b''):
-                    h.update(block)
-            return h.hexdigest()
-
-        def members(z):
-            items = z.infolist()
-            if len(items) > 40000 or sum(x.file_size for x in items) > MAX_EXPANDED:
-                raise ResolveError('Archive exceeds the safe extraction limit.')
-            seen = set()
-            for x in items:
-                p = PurePosixPath(x.filename)
-                if (p.is_absolute() or '..' in p.parts or '\\' in x.filename
-                        or ':' in x.filename or stat.S_ISLNK(x.external_attr >> 16)):
-                    raise ResolveError('Unsafe archive path: ' + repr(x.filename))
-                if x.flag_bits & 1:
-                    raise ResolveError('Encrypted archives cannot be deployed.')
-                normalized = str(p).casefold().rstrip('/')
-                if normalized in seen:
-                    raise ResolveError('Duplicate archive path: ' + repr(x.filename))
-                seen.add(normalized)
-            return items
-
-        class Resolver:
-            def __init__(self, work, releases, fetch_asset, pinned='', source='auto', release_loader=None):
-                self.work = Path(work).resolve()
-                self.staging = self.work / '_r99_downloads'
-                self.staging.mkdir(exist_ok=True)
-                self.output = self.work / '_r99_package' / 'tixterex'
-                self.releases = [r for r in releases if not r.get('draft') and (pinned or not r.get('prerelease'))]
-                self.releases.sort(key=lambda r: (r.get('published_at') or '', r.get('created_at') or ''), reverse=True)
-                self.fetch_asset = fetch_asset
-                self.release_loader = release_loader
-                self._releases_loaded = release_loader is None
-                self.pinned = pinned
-                self.source = source
-                self.archives = {}
-                self.cache = {}
-                self.total_bytes = 0
-                self.expanded_bytes = 0
-                self.report = {'schema': 'tixterex-workflow-resolution/1', 'status': 'checking',
-                               'workflowRevision': 'r99', 'workflowPatch': 'deterministic-upload-selection', 'assetsSeen': [], 'warnings': [], 'placeParts': [], 'ignoredApplications': []}
-
-            def inspect(self, path, label, depth=0):
-                path = Path(path)
-                if path.stat().st_size > MAX_ZIP:
-                    raise ResolveError('ZIP is larger than the download safety limit: ' + label)
-                sha = digest(path)
-                if sha in self.archives:
-                    return self.archives[sha]
-                result = {'path': path, 'sha256': sha, 'label': label, 'apps': [], 'inventories': []}
-                self.archives[sha] = result
-                try:
-                    with zipfile.ZipFile(path) as z:
-                        items = members(z)
-                        self.expanded_bytes += sum(x.file_size for x in items)
-                        if self.expanded_bytes > 2 * MAX_TOTAL:
-                            raise ResolveError('Cumulative archive expansion allowance exhausted.')
-                        names = set(z.namelist())
-                        for x in items:
-                            if x.is_dir():
-                                continue
-                            if x.filename.endswith('/BUNDLE_INPUTS.json') or x.filename == 'BUNDLE_INPUTS.json':
-                                prefix = x.filename[:-len('BUNDLE_INPUTS.json')]
-                                needed = ['site/index.html', 'tools/release/assemble.py', 'tools/recovery/readiness_gate.py',
-                                          'tools/release/check_package.py', 'tools/cf_budget.mjs']
-                                if all(prefix + n in names for n in needed):
-                                    manifest = json.loads(z.read(x))
-                                    parts = manifest.get('requiredParts', [])
-                                    if not isinstance(parts, list):
-                                        raise ResolveError('Invalid place manifest: ' + label)
-                                    pn = []
-                                    for part in parts:
-                                        if (not isinstance(part, dict) or part.get('name') not in PART_NAMES
-                                                or not re.fullmatch(r'[a-f0-9]{64}', str(part.get('sha256', '')))):
-                                            raise ResolveError('Invalid required part in ' + label)
-                                        pn.append(part['name'])
-                                    if len(pn) != len(set(pn)):
-                                        raise ResolveError('Duplicate part declaration in ' + label)
-                                    result['apps'].append({'archive': result, 'prefix': prefix, 'manifest': manifest,
-                                                           'rank': int(prefix + 'src/manifest.json' in names),
-                                                           'releaseKey': release_key(manifest.get('release', '')),
-                                                           'identity': app_identity(z, prefix, names),
-                                                           'hasLocalities': any(y.startswith(prefix+'site/data/localities/') and not y.endswith('/') for y in names),
-                                                           'updatedAt': ''})
-                            if x.filename.endswith('/data/ingest/index.json') and all(
-                                y.is_dir() or '/site/data/ingest/' in y.filename for y in items
-                            ):
-                                result['inventories'].append(x.filename[:-len('index.json')])
-                        if depth < 2:
-                            for i, x in enumerate(items):
-                                if x.is_dir() or not x.filename.lower().endswith('.zip'):
-                                    continue
-                                if x.file_size > MAX_ZIP:
-                                    raise ResolveError('Nested ZIP is too large: ' + x.filename)
-                                self.total_bytes += x.file_size
-                                if self.total_bytes > MAX_TOTAL:
-                                    raise ResolveError('Download/expansion allowance exhausted.')
-                                child = self.staging / (sha[:16] + '-' + str(i) + '.zip')
-                                with z.open(x) as src, open(child, 'wb') as dst:
-                                    shutil.copyfileobj(src, dst)
-                                found = self.inspect(child, label + ' > ' + x.filename, depth + 1)
-                                result['apps'].extend(found['apps'])
-                except ResolveError:
-                    self.archives.pop(sha, None)
-                    raise
-                except (zipfile.BadZipFile, json.JSONDecodeError, ValueError, KeyError) as exc:
-                    self.archives.pop(sha, None)
-                    raise ResolveError('Unreadable ZIP or manifest: ' + label) from exc
-                return result
-
-            def download(self, release, asset):
-                aid = asset.get('id')
-                if not isinstance(aid, int) or aid <= 0:
-                    raise ResolveError('Invalid GitHub asset ID.')
-                if aid in self.cache:
-                    return self.cache[aid]
-                if asset.get('state', 'uploaded') != 'uploaded':
-                    raise ResolveError('A release file is still uploading: ' + str(asset.get('name')))
-                if int(asset.get('size') or 0) > MAX_ZIP:
-                    raise ResolveError('Asset exceeds the size allowance: ' + str(asset.get('name')))
-                path = self.staging / ('asset-' + str(aid) + '.zip')
-                self.fetch_asset(asset, path)
-                size = path.stat().st_size
-                if size > MAX_ZIP:
-                    raise ResolveError('Downloaded asset is too large.')
-                expected_size = asset.get('size')
-                if expected_size is not None and size != int(expected_size):
-                    raise ResolveError('Incomplete asset download: ' + str(asset.get('name')))
-                d = asset.get('digest') or ''
-                if d.startswith('sha256:') and digest(path) != d[7:]:
-                    raise ResolveError('GitHub asset SHA-256 mismatch: ' + str(asset.get('name')))
-                self.total_bytes += size
-                if self.total_bytes > MAX_TOTAL:
-                    raise ResolveError('Download allowance exhausted.')
-                ref = self.inspect(path, str(release.get('tag_name')) + ': ' + str(asset.get('name')))
-                for app in ref['apps']:
-                    app['updatedAt'] = str(asset.get('updated_at') or asset.get('created_at') or '')
-                self.cache[aid] = ref
-                return ref
-
-            def release_apps(self, release):
-                apps = []
-                assets = [a for a in release.get('assets', []) if str(a.get('name', '')).lower().endswith('.zip')]
-                self.report['assetsSeen'].append({'tag': release.get('tag_name'), 'names': [a.get('name') for a in assets]})
-                if len(assets) > 60:
-                    raise ResolveError('Release has too many ZIPs to inspect safely. Upload the three replacement ZIPs under Code.')
-                for asset in assets:
-                    name = str(asset.get('name', '')).lower()
-                    if any(x in name for x in ['places-', 'verification-evidence', 'inventory', 'workflow-only', 'workflow-fixed']):
-                        continue
-                    apps.extend(self.download(release, asset)['apps'])
-                return apps
-
-            def local_archives(self):
-                out = []
-                for base, dirs, names in os.walk(self.work):
-                    rel = Path(base).relative_to(self.work)
-                    dirs[:] = sorted(d for d in dirs if not d.startswith(('.', '_'))
-                                     and d not in {'node_modules', 'site', 'src', 'tools'} and len(rel.parts) < 2)
-                    for name in sorted(names):
-                        if not name.lower().endswith('.zip'):
-                            continue
-                        path = Path(base) / name
-                        if path.is_symlink():
-                            continue
-                        try:
-                            out.append(self.inspect(path, 'repository: ' + str(rel/name)))
-                        except ResolveError as exc:
-                            # An unrelated old/broken archive is not the chosen replacement.
-                            self.report['warnings'].append('Skipped unselected archive '+str(rel/name)+': '+str(exc))
-                return out
-
-            def ensure_releases(self):
-                if self._releases_loaded:
-                    return
-                self._releases_loaded = True
-                rows = self.release_loader()
-                self.releases = [r for r in rows if not r.get('draft') and (self.pinned or not r.get('prerelease'))]
-                self.releases.sort(key=lambda r: (r.get('published_at') or '', r.get('created_at') or ''), reverse=True)
-
-            def local_application(self):
-                # Browser download suffixes are application uploads, not unrelated backups.
-                # Compare embedded revisions inside this narrow filename family. Never mix.
-                pattern = re.compile(r'^tixterex-release(?:(?:\s*\(\d+\))|(?:[.\-]\d+))?\.zip$', re.I)
-                candidates=[]; seen=[]
-                for folder in [self.work,self.work/'uploads']:
-                    if not folder.is_dir():
-                        continue
-                    for path in sorted(folder.iterdir()):
-                        if not path.is_file() or not pattern.fullmatch(path.name):
-                            continue
-                        if path.is_symlink():
-                            raise ResolveError('The replacement ZIP must not be a symbolic link.')
-                        label='repository: '+str(path.relative_to(self.work))
-                        ref=self.inspect(path,label)
-                        seen.append(label)
-                        candidates.extend(ref['apps'])
-                        if not ref['apps']:
-                            self.report['warnings'].append('Unqualified older upload: '+label)
-                if seen:
-                    if not candidates:
-                        raise ResolveError('tixterex-release.zip does not contain the repaired TixTerex application and build tools.')
-                    candidate=self.choose(candidates)
-                    self.report['selectionPolicy']='newest embedded revision in the same-name application upload family; unrelated backup ZIPs and old Releases ignored'
-                    self.report['applicationUploadsSeen']=seen
-                    return candidate
-                apps = [a for archive in self.local_archives() for a in archive['apps']]
-                candidate = self.choose(apps)
-                if candidate:
-                    self.report['selectionPolicy']='newest embedded application revision among Code ZIPs; no cross-version merge'
-                return candidate
-
-            def choose(self, apps):
-                if not apps:
-                    return None
-                unique = {(a['archive']['sha256'], a['prefix']): a for a in apps}
-                candidates = list(unique.values())
-                newest = max(a['releaseKey'] for a in candidates)
-                finalists = [a for a in candidates if a['releaseKey'] == newest]
-                identities = {a['identity'] for a in finalists}
-                if len(identities) > 1:
-                    # A replace/upload timestamp is meaningful within one Release only.
-                    times = {a.get('updatedAt','') for a in finalists}
-                    if '' not in times and len(times) > 1:
-                        newest_time = max(times)
-                        finalists = [a for a in finalists if a['updatedAt'] == newest_time]
-                        identities = {a['identity'] for a in finalists}
-                    if len(identities) > 1:
-                        versions = ', '.join(sorted({str(a['manifest'].get('release')) for a in finalists}))
-                        raise ResolveError('Conflicting files have the SAME embedded application revision ('+versions+
-                                           '). Upload the intended replacement as tixterex-release.zip in Code; old ZIPs can stay.')
-                # Identical application/build code in a full kit and split release is not ambiguity.
-                winner = sorted(finalists, key=lambda a: (-int(a['hasLocalities']), -a['rank'],
-                                                         len(a['prefix']), a['archive']['label']))[0]
-                for a in candidates:
-                    if a is winner:
-                        continue
-                    self.report['ignoredApplications'].append({
-                        'file': a['archive']['label'], 'applicationRelease': a['manifest'].get('release'),
-                        'reason': 'same application copy' if a['identity']==winner['identity'] else 'older application revision'
-                    })
-                return winner
-
-            def extract(self, archive, prefix, destination, data_only=False):
-                destination = Path(destination)
-                with zipfile.ZipFile(archive['path']) as z:
-                    for x in members(z):
-                        if not x.filename.startswith(prefix) or x.is_dir():
-                            continue
-                        suffix = x.filename[len(prefix):]
-                        rel = PurePosixPath(suffix)
-                        if not suffix or rel.suffix.lower() in FONT_EXT:
-                            continue
-                        if data_only and rel.suffix.lower() not in {'.json', '.ics'}:
-                            raise ResolveError('Unexpected file type in a data archive: ' + suffix)
-                        target = destination.joinpath(*rel.parts)
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        with z.open(x) as src, open(target, 'wb') as dst:
-                            shutil.copyfileobj(src, dst)
-
-            def places_complete(self):
-                path = self.output / 'site/data/places.json'
-                if not path.is_file():
-                    return False
-                meta = json.loads(path.read_text(encoding='utf-8'))
-                refs = set(meta.get('parts', {}).values()) | {x['url'] for x in meta.get('spatial', []) if 'url' in x}
-                for ref in refs:
-                    p = PurePosixPath(ref)
-                    if p.is_absolute() or '..' in p.parts or '\\' in ref:
-                        raise ResolveError('Unsafe locality reference.')
-                self.report['placeFilesExpected'] = len(refs)
-                missing = [r for r in refs if not (self.output/'site/data'/r).is_file()]
-                self.report['placeFilesMissing'] = len(missing)
-                return bool(refs) and not missing
-
-            def find_parts(self, parts, selected):
-                def missing():
-                    return [p for p in parts if p['sha256'] not in self.archives]
-                # Reuse local files and current-release assets first, then only hash-compatible data from older releases.
-                self.local_archives()
-                if missing():
-                    self.ensure_releases()
-                for release in [selected] + [r for r in self.releases if r is not selected]:
-                    if release is None or not missing():
-                        continue
-                    for asset in release.get('assets', []):
-                        name = str(asset.get('name', '')).lower()
-                        if not name.endswith('.zip'):
-                            continue
-                        sha = str(asset.get('digest') or '').removeprefix('sha256:')
-                        wanted = {p['sha256'] for p in missing()}
-                        if sha and re.fullmatch('[a-f0-9]{64}', sha) and sha not in wanted and 'kit' not in name:
-                            continue
-                        if release is not selected and not any(k in name for k in ['place', 'kit']):
-                            continue
-                        self.download(release, asset)
-                        if not missing():
-                            break
-                if missing():
-                    names = ', '.join(p['name'] for p in missing())
-                    raise ResolveError('Application found, but these matching data parts are not uploaded: ' + names +
-                                       '. Upload the named place ZIPs alongside tixterex-release.zip under Code. Do not change their contents.')
-                for part in parts:
-                    archive = self.archives[part['sha256']]
-                    prefix = 'tixterex/site/data/localities/'
-                    with zipfile.ZipFile(archive['path']) as z:
-                        if any(not x.is_dir() and not x.filename.startswith(prefix) for x in members(z)):
-                            raise ResolveError('Unexpected file in locality archive.')
-                    self.extract(archive, prefix, self.output/'site/data/localities', data_only=True)
-                    self.report['placeParts'].append({'name': part['name'], 'sha256': part['sha256'], 'obtainedFrom': archive['label']})
-
-            def run(self):
-                selected = None
-                app = None
-                if self.source not in ['auto', 'uploads', 'release', 'repository']:
-                    raise ResolveError('Source must be auto, uploads, release or repository.')
-                if self.source == 'repository':
-                    root = self.work
-                    if not (root/'site/index.html').is_file() or not (root/'tools/release/assemble.py').is_file():
-                        raise ResolveError('Repository mode needs the complete repaired site and tools.')
-                    if self.output.parent.exists():
-                        shutil.rmtree(self.output.parent)
-                    self.output.mkdir(parents=True)
-                    for name in ['site', 'tools', 'src', 'qa', 'benchmark']:
-                        if (root/name).is_dir():
-                            shutil.copytree(root/name, self.output/name)
-                    if not self.places_complete():
-                        raise ResolveError('Checked-in source has an incomplete place directory. Use the complete restored source ZIP.')
-                    self.report['application'] = 'repository source'
-                    mf = root/'BUNDLE_INPUTS.json'
-                    self.report['applicationRelease'] = json.loads(mf.read_text()).get('release') if mf.is_file() else None
-                else:
-                    if self.source in ['auto', 'uploads'] and not self.pinned:
-                        app = self.local_application()
-                        if app is None and self.source == 'uploads':
-                            raise ResolveError('Upload tixterex-release.zip to the top-level Code file list.')
-                    if app is None:
-                        self.ensure_releases()
-                        candidates = self.releases
-                        if self.pinned:
-                            candidates = [r for r in candidates if r.get('tag_name') == self.pinned]
-                            if not candidates:
-                                raise ResolveError('The selected published release was not found: ' + self.pinned)
-                        for release in candidates:
-                            apps = self.release_apps(release)
-                            app = self.choose(apps)
-                            if app:
-                                selected = release
-                                break
-                            self.report['warnings'].append('No deployable application in release ' + str(release.get('tag_name')))
-                            if self.pinned:
-                                break
-                    if app is None:
-                        raise ResolveError('No repaired application ZIP was found. Upload tixterex-release.zip and its two place ZIPs under Code. '
-                                           'A workflow ZIP alone is not the website.')
-                    if self.output.parent.exists():
-                        shutil.rmtree(self.output.parent)
-                    self.extract(app['archive'], app['prefix'], self.output)
-                    self.report['application'] = app['archive']['label']
-                    self.report['applicationSha256'] = app['archive']['sha256']
-                    self.report['applicationRelease'] = app['manifest'].get('release')
-                    self.report['releaseTag'] = selected.get('tag_name') if selected else None
-                    self.report['completeSourceArchive'] = bool(app['rank'])
-                    if not self.places_complete():
-                        self.find_parts(app['manifest'].get('requiredParts', []), selected)
-                    if not self.places_complete():
-                        raise ResolveError('The application still has missing place files after archive assembly.')
-                    if selected is None:
-                        # Preserve an explicitly uploaded collection snapshot; ordinary app
-                        # replacement does not create, refresh or fabricate any inventory.
-                        for relative in ['tixterex-inventory.zip', 'uploads/tixterex-inventory.zip']:
-                            path = self.work / relative
-                            if not path.is_file():
-                                continue
-                            ref = self.inspect(path, 'repository: ' + relative)
-                            if len(ref['inventories']) != 1:
-                                raise ResolveError('Uploaded inventory ZIP has no unique validated inventory root.')
-                            self.extract(ref, ref['inventories'][0], self.output/'site/data/ingest', data_only=True)
-                            self.report['inventory'] = ref['label']
-                            break
-                    if selected:
-                        inventories = []
-                        for asset in selected.get('assets', []):
-                            if 'inventory' in str(asset.get('name', '')).lower() and str(asset.get('name', '')).lower().endswith('.zip'):
-                                ref = self.download(selected, asset)
-                                for prefix in ref['inventories']:
-                                    inventories.append((ref, prefix))
-                        if len(inventories) > 1:
-                            raise ResolveError('Multiple inventory snapshots found. Keep one current snapshot.')
-                        for ref, prefix in inventories:
-                            self.extract(ref, prefix, self.output/'site/data/ingest', data_only=True)
-                            self.report['inventory'] = ref['label']
-                self.report['status'] = 'resolved'
-                self.report['inputDirectory'] = str(self.output)
-                return self.output
-
-        def cli():
-            work = Path.cwd()
-            report_path = work/'_reports/download-report.json'
-            report_path.parent.mkdir(exist_ok=True)
-            repo = os.environ.get('REPO', '')
-            if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
-                raise ResolveError('Invalid repository identifier.')
-            def api(endpoint):
-                result = subprocess.run(['gh', 'api', endpoint, '-H', 'Accept: application/vnd.github+json'], capture_output=True, text=True)
-                if result.returncode:
-                    raise ResolveError('GitHub API request failed for ' + endpoint + ': ' + result.stderr.strip()[:800])
-                return json.loads(result.stdout)
-            event = os.environ.get('GITHUB_EVENT_NAME', '')
-            # Ordinary Code uploads always select Code ZIPs first, even if an old
-            # repository variable still says "release". An explicit manual choice remains.
-            source = os.environ.get('INPUT_SOURCE') or ('auto' if event == 'push' else os.environ.get('CONFIG_SOURCE') or 'auto')
-            pinned = os.environ.get('RELEASE_TAG', '').strip()
-            if any(c in pinned for c in '\r\n') or len(pinned) > 240:
-                raise ResolveError('Invalid release tag.')
-            def load_releases():
-                releases = []
-                if pinned:
-                    releases.append(api('repos/' + repo + '/releases/tags/' + urllib.parse.quote(pinned, safe='')))
-                for page in range(1, 4):
-                    batch = api('repos/' + repo + '/releases?per_page=100&page=' + str(page))
-                    releases.extend(r for r in batch if r.get('id') not in {x.get('id') for x in releases})
-                    if len(batch) < 100:
-                        break
-                for release in releases:
-                    assets = []
-                    for page in range(1, 5):
-                        batch = api('repos/' + repo + '/releases/' + str(int(release['id'])) + '/assets?per_page=100&page=' + str(page))
-                        assets.extend(batch)
-                        if len(batch) < 100:
-                            break
-                    release['assets'] = assets
-                return releases
-            def fetch(asset, target):
-                endpoint = 'repos/' + repo + '/releases/assets/' + str(int(asset['id']))
-                for attempt in range(3):
-                    with open(target, 'wb') as stream:
-                        result = subprocess.run(['gh', 'api', endpoint, '-H', 'Accept: application/octet-stream'], stdout=stream, stderr=subprocess.PIPE)
-                    if result.returncode == 0:
-                        return
-                    if attempt == 2:
-                        raise ResolveError('Download failed for asset ' + str(asset.get('name')) + ': ' + result.stderr.decode(errors='replace')[:800])
-            resolver = Resolver(work, [], fetch, pinned, source, release_loader=load_releases)
-            try:
-                result = resolver.run()
-                with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
-                    stream.write('TF_INPUT=' + str(result) + '\n')
-                    stream.write('TF_ARTIFACT=' + ('release:' + str(resolver.report.get('releaseTag')) if resolver.report.get('releaseTag') else 'repository-archive') + '\n')
-            except Exception as exc:
-                resolver.report['status'] = 'failed'
-                resolver.report['error'] = str(exc)
-                raise
-            finally:
-                report_path.write_text(json.dumps(resolver.report, indent=2), encoding='utf-8')
-                summary = os.environ.get('GITHUB_STEP_SUMMARY')
-                if summary:
-                    with open(summary, 'a', encoding='utf-8') as stream:
-                        stream.write('\n## Release file resolution\n\n```json\n' + json.dumps(resolver.report, indent=2) + '\n```\n')
-            print(json.dumps(resolver.report, indent=2))
-
-        if __name__ == '__main__':
-            try:
-                cli()
-            except Exception as exc:
-                text = str(exc).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-                print('::error::' + text, file=sys.stderr)
-                raise SystemExit(1)
-        PY_RESOLVE
-    - name: Check replacement package includes its tests
-      run: |-
-        set -euo pipefail
-        mkdir -p _reports
-        python3 - <<'PY_CONTRACT'
-        import os,json,re
-        from pathlib import Path
-        root=Path(os.environ['TF_INPUT'])
-        manifest=json.loads((root/'BUNDLE_INPUTS.json').read_text())
-        version=str(manifest.get('release',''))
-        match=re.match(r'^[ar](\d+)',version.lower())
-        required=['tools/build_site.py','tools/release/assemble.py','tools/quality/browser_gate.py',
-                  'tools/release/workflow_guard.py','qa/r97/test_inventory.py','qa/r97/test_ingest.mjs',
-                  'qa/r97/test_calendar.mjs','qa/r99/test_workflow_guard.py',
-                  'qa/r99/test_inputs.py','tools/quality/test_inputs.py']
-        missing=[x for x in required if not (root/x).is_file()]
-        waiting=bool(missing and match and int(match[1])<99)
-        ready=not missing
-        report={'ready':ready,'waitingForApplicationUpload':waiting,'applicationRelease':version,'missing':missing,'published':False}
-        Path('_reports/package-contract.json').write_text(json.dumps(report,indent=2)+'\n')
-        with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('ready='+str(ready).lower()+'\n')
-        if waiting:
-            print('::notice::Workflow installed. The prior website is unchanged. Upload the replacement tixterex-release.zip in Code to complete the update.')
-            with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
-                f.write('\n## Workflow installed; application upload pending\n\n')
-                f.write('No website was published by this run. The existing site remains unchanged. The same-name application ZIP upload will start the complete build automatically.\n')
-        elif missing:
-            raise SystemExit('The selected application archive is incomplete: '+', '.join(missing))
-        print(json.dumps(report,indent=2))
-        PY_CONTRACT
-      id: package_contract
-    - name: Restore existing collection data without running a crawler
-      uses: actions/cache/restore@v5
-      with:
-        path: _ingest
-        key: tixterex-read-only-${{ github.run_id }}-${{ github.run_attempt }}
-        restore-keys: |
-          tixterex-ingest-v2-
-          ingest-
-      if: ${{ steps.package_contract.outputs.ready == 'true' }}
-    - name: Configure GitHub Pages
-      id: pages
-      uses: actions/configure-pages@v6
-      if: ${{ steps.package_contract.outputs.ready == 'true' }}
-    - name: Assemble and validate the complete public website
-      id: assemble
-      env:
-        PAGE_BASE: ${{ steps.pages.outputs.base_path }}
-        PAGE_URL: ${{ steps.pages.outputs.base_url }}
-      run: |
-        set -euo pipefail
-        mkdir -p _reports
-        if [ -f "$TF_INPUT/src/manifest.json" ]; then
-          python3 "$TF_INPUT/tools/build_site.py" --root "$TF_INPUT" --check
-        fi
-        BUILD="r99-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-        export BUILD
-        python3 "$TF_INPUT/tools/release/assemble.py" --input "$TF_INPUT" --output _site --cache _ingest --build "$BUILD" --base-path "${PAGE_BASE:-/}" --site-url "$PAGE_URL" > _reports/assembly.json
-        python3 "$TF_INPUT/tools/recovery/readiness_gate.py" _site --mode package --output _reports/package-health.json
-        python3 "$TF_INPUT/tools/release/check_package.py" _site --output _reports/package-tests.json
-        node "$TF_INPUT/tools/cf_budget.mjs" _site --json > _reports/public-output.json
-        cp _site/supply-health.json _reports/
-        python3 - <<'PY_SUMMARY'
-        import json, os
-        from pathlib import Path
-        health = json.loads(Path('_reports/supply-health.json').read_text())
-        selection = json.loads(Path('_reports/download-report.json').read_text())
-        info_path = Path('_site/release-info.json')
-        info = json.loads(info_path.read_text())
-        info.update(workflowRevision='r99', workflowPatch='ubuntu24-python312-isolated-ci-fixtures', applicationRelease=selection.get('applicationRelease'), releaseTag=selection.get('releaseTag'), artifactSha256=selection.get('applicationSha256'))
-        info_path.write_text(json.dumps(info, indent=2)+'\n')
-        Path('_reports/deployment-expected.json').write_text(json.dumps(info, indent=2)+'\n')
-        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-            f.write('build='+os.environ['BUILD']+'\n')
-            f.write('site_sha256='+info['siteSha256']+'\n')
-        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-            f.write('\n## Website package ready\n\n')
-            f.write('Build: **'+os.environ['BUILD']+'**. Application: **'+str(selection.get('applicationRelease') or selection.get('application'))+'**.\n\n')
-            f.write('The assembled website passed the package checks. Deployment has not yet been verified.\n\n')
-            f.write('Collected cities: **'+str(health.get('cities',0))+'**. Future/ongoing stored occurrences: **'+str(health.get('futureOrOngoingOccurrences',0))+'**.\n\n')
-            f.write('This workflow does not run the external crawler. Global 100/75 recall is not measured.\n')
-            if not health.get('futureOrOngoingOccurrences'):
-                f.write('\n**EVENT SUPPLY NOT READY.** Publishing a UI repair does not establish event coverage.\n')
-        PY_SUMMARY
-      if: ${{ steps.package_contract.outputs.ready == 'true' }}
-    - name: Check event preservation and calendar exports
-      run: |
-        set -euo pipefail
-        python3 "$TF_INPUT/qa/r97/test_inventory.py"
-        node "$TF_INPUT/qa/r97/test_ingest.mjs" _reports/ingest-tests.json
-        node "$TF_INPUT/qa/r97/test_calendar.mjs" "$TF_INPUT/tools/ingest.mjs" _reports/calendar-tests.json
-
-        python3 "$TF_INPUT/qa/r99/test_workflow_guard.py"
-        python3 "$TF_INPUT/qa/r97/test_resolver.py"
-        python3 "$TF_INPUT/qa/r99/test_inputs.py"
-      id: data_checks
-      if: ${{ steps.package_contract.outputs.ready == 'true' }}
-    - name: Install pinned browser test runtime
-      run: |
-        set -euo pipefail
-        mkdir -p _reports
-        export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/tixterex-playwright-1.57.0"
-        printf 'PLAYWRIGHT_BROWSERS_PATH=%s\n' "$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
-        # ubuntu-latest moved to an OS unsupported by Playwright 1.57.0.
-        # Check the explicit runner/Python contract instead of guessing a fallback OS.
-        python3 - <<'PY_RUNTIME'
-        import json,os,platform,sys
-        from pathlib import Path
-        osinfo=platform.freedesktop_os_release()
-        report={'runnerOS':osinfo.get('ID'),'runnerVersion':osinfo.get('VERSION_ID'),
-                'architecture':platform.machine(),'python':platform.python_version(),
-                'playwrightRequired':'1.57.0','browserInstalled':False}
-        Path('_reports/browser-runtime.json').write_text(json.dumps(report,indent=2)+'\n')
-        print(json.dumps(report,indent=2))
-        if (report['runnerOS'],report['runnerVersion'])!=('ubuntu','24.04'):
-            raise SystemExit('The workflow must run on ubuntu-24.04; no unsupported-OS override is allowed.')
-        if sys.version_info[:2]!=(3,12):
-            raise SystemExit('The browser test interpreter must be Python 3.12.')
-        PY_RUNTIME
-        python3 -m venv "$RUNNER_TEMP/tixterex-qa"
-        "$RUNNER_TEMP/tixterex-qa/bin/python" -m pip install --disable-pip-version-check playwright==1.57.0
-        "$RUNNER_TEMP/tixterex-qa/bin/python" -m playwright install --with-deps chromium
-        "$RUNNER_TEMP/tixterex-qa/bin/python" - <<'PY_SMOKE'
-        import importlib.metadata,json
-        from pathlib import Path
-        from playwright.sync_api import sync_playwright
-        report_path=Path('_reports/browser-runtime.json')
-        report=json.loads(report_path.read_text())
-        report['playwrightInstalled']=importlib.metadata.version('playwright')
-        assert report['playwrightInstalled']=='1.57.0'
-        with sync_playwright() as pw:
-            report['browserPath']=pw.chromium.executable_path
-            with pw.chromium.launch() as browser:
-                page=browser.new_page()
-                page.set_content('<!doctype html><title>TixTerex runtime check</title><p id="ok">ready</p>')
-                assert page.title()=='TixTerex runtime check'
-                assert page.locator('#ok').inner_text()=='ready'
-                report.update(browserInstalled=True,browserVersion=browser.version)
-        report_path.write_text(json.dumps(report,indent=2)+'\n')
-        print(json.dumps(report,indent=2))
-        PY_SMOKE
-      id: browser_install
-      if: ${{ steps.package_contract.outputs.ready == 'true' }}
-    - name: Test the built website before publishing
-      env:
-        PAGE_BASE: ${{ steps.pages.outputs.base_path }}
-      run: |
-        set -euo pipefail
-        for WIDTH in 320 390 430 768 1440; do
-          timeout 150s "$RUNNER_TEMP/tixterex-qa/bin/python" "$TF_INPUT/tools/quality/browser_gate.py" --site _site --base-path "${PAGE_BASE:-/}" --widths "$WIDTH" --inventory-count 1 --output "_reports/browser/$WIDTH"
-        done
-        # Repeat on a phone with empty and multi-event caches. All fixtures stay in test responses.
-        for COUNT in 0 5; do
-          timeout 150s "$RUNNER_TEMP/tixterex-qa/bin/python" "$TF_INPUT/tools/quality/browser_gate.py" --site _site --base-path "${PAGE_BASE:-/}" --widths 390 --inventory-count "$COUNT" --output "_reports/browser/inventory-$COUNT"
-        done
-      id: browser_acceptance
-      if: ${{ steps.package_contract.outputs.ready == 'true' }}
-    - name: Keep browser acceptance evidence
-      if: always()
-      uses: actions/upload-artifact@v7
-      with:
-        name: tixterex-browser-${{ github.run_id }}-${{ github.run_attempt }}
-        path: _reports/browser/
-        if-no-files-found: ignore
-        retention-days: 14
-    - name: Upload the validated public website
-      uses: actions/upload-pages-artifact@v5
-      with:
-        path: _site
-      if: ${{ steps.package_contract.outputs.ready == 'true' }}
-    - name: Show the exact first failing step
-      id: failure_summary
-      if: ${{ failure() }}
-      env:
-        STEP_RESULTS: ${{ toJSON(steps) }}
-        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      run: |-
-        set -euo pipefail
-        mkdir -p _reports
-        python3 - <<'PY_FAILURE'
-        import json,os
-        from pathlib import Path
-        steps=json.loads(os.environ['STEP_RESULTS'])
-        failed=[name for name,s in steps.items() if s.get('outcome')=='failure']
-        report={'workflowRevision':'r99','failedSteps':failed,'runUrl':os.environ['RUN_URL'],'publishedByThisBuild':False}
-        Path('_reports/first-failure.json').write_text(json.dumps(report,indent=2)+'\n')
-        with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
-            f.write('\n## Update stopped before publication\n\n')
-            f.write('First failing step ID: **'+(failed[0] if failed else 'unknown')+'**.\n\n')
-            f.write('The prior website has not been replaced by this build. Open the failed step for its exact error.\n')
-            f.write('Run: '+os.environ['RUN_URL']+'\n')
-        print(json.dumps(report,indent=2))
-        PY_FAILURE
-    - name: Keep all build and test diagnostics
-      if: ${{ always() }}
-      uses: actions/upload-artifact@v7
-      with:
-        name: tixterex-health-${{ github.run_id }}-${{ github.run_attempt }}
-        path: _reports/
-        if-no-files-found: ignore
-        retention-days: 14
-    concurrency:
-      group: tixterex-build-${{ github.ref }}
-      cancel-in-progress: true
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # A92 (owner, 25 Nov 2026): the normal way to update is to drop the zips on the repository's "Upload files" page.
+      # The browser may rename them ("tixterex-release (8).zip"); the newest upload of each kind wins, by its commit time.
+      # A missing place directory is taken from the newest earlier upload or release that has it. Nothing else is guessed.
+      - name: Unpack the newest uploaded website (or the latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          newest() { local best="" bt=0 t; for f in $1; do [ -f "$f" ] || continue; t=$(gh api "repos/$REPO/commits?path=$(printf %s "$f" | jq -sRr @uri)&per_page=1" --jq '.[0].commit.committer.date' 2>/dev/null); t=$(date -d "${t:-1970-01-01}" +%s); if [ "$t" -ge "$bt" ]; then bt=$t; best=$f; fi; done; printf %s "$best"; }
+          REL=$(newest 'tixterex-release*.zip'); P1=$(newest 'tixterex-places-1*.zip'); P2=$(newest 'tixterex-places-2*.zip')
+          if [ -n "$REL" ] && [ ! -f site/index.html ]; then
+            mkdir -p _relx _rel
+            unzip -tq "$REL" >/dev/null || { echo "::error::$REL is damaged; upload it again"; exit 1; }
+            unzip -qo "$REL" -d _relx
+            for P in "$P1" "$P2"; do [ -n "$P" ] && unzip -qo "$P" -d _relx; done
+            if [ -z "$P1" ] || [ -z "$P2" ]; then gh release download --repo "$REPO" --pattern 'tixterex-places-*.zip' --dir _rel --clobber 2>/dev/null || true; for Z in _rel/*.zip; do [ -f "$Z" ] && unzip -qo "$Z" -d _relx; done; fi
+            R=$(dirname "$(dirname "$(find _relx -path '*/site/index.html' | head -1)")")
+            [ -f "$R/site/index.html" ] || { echo "::error::$REL has no site/index.html"; exit 1; }
+            cp -r "$R/site" "$R/tools" . && rm -rf _rel _relx
+            echo "Website taken from the upload $REL (places: ${P1:-release} / ${P2:-release})"; echo "::notice::Deploying $REL"
+          fi
+          if [ ! -f site/index.html ]; then
+            gh release download --repo "$REPO" --pattern '*.zip' --dir _rel --clobber
+            # a release may come in several parts, each under 25 MB (website + place directory); all parts are merged
+            mkdir -p _relx && for Z in _rel/*.zip; do unzip -qo "$Z" -d _relx; done; Z=$(ls _rel/*.zip | tr '\n' ' ')
+            R=$(dirname "$(dirname "$(find _relx -path '*/site/index.html' | head -1)")")
+            cp -r "$R/site" "$R/tools" . && rm -rf _rel _relx
+            echo "Website taken from release assets: $Z"
+          fi
+      - name: Find the website folder
+        run: |
+          if [ -f site/index.html ]; then echo "SRC=site" >> "$GITHUB_ENV"; else echo "SRC=." >> "$GITHUB_ENV"; fi
+      - name: Apply the brand (A78 - name and web address from tools/brand/brand.json, or the BRAND_NAME or BRAND_DOMAIN variables)
+        env:
+          BRAND_NAME: ${{ vars.BRAND_NAME }}
+          BRAND_DOMAIN: ${{ vars.BRAND_DOMAIN }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # the web address: the variable, else the custom domain set under Settings → Pages, else the brand file
+          D="$BRAND_DOMAIN"; if [ -z "$D" ]; then D=$(gh api "repos/$REPO/pages" --jq '.cname // empty' 2>/dev/null || true); fi
+          if ! printf '%s' "$D" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then D=""; fi
+          # switches every visible name and address in this run's copy (the repository itself stays as it is) and,
+          # for a new name, draws the logo, app icons, favicon and social picture with the runner's own Chrome
+          node tools/rebrand.mjs --name "$BRAND_NAME" --domain "$D" "$SRC" tools
+          echo "TF_DOMAIN=$(node -e 'import("./tools/rebrand.mjs").then(m=>process.stdout.write(m.resolveBrand({name:process.argv[1],domain:process.argv[2]}).domain))' "$BRAND_NAME" "$D")" >> "$GITHUB_ENV"
+      - name: Bring back last night's programmes
+        uses: actions/cache/restore@v4
+        with:
+          path: _ingest
+          key: ingest-${{ github.run_id }}
+          restore-keys: ingest-
+      - name: Key for the suggestion box (derived from the Cloudflare token, never printed)
+        run: |
+          if [ -n "$CLOUDFLARE_API_TOKEN" ]; then T=$(printf '%s' "$CLOUDFLARE_API_TOKEN:tf-contrib" | sha256sum | cut -c1-64); echo "::add-mask::$T"; echo "CONTRIB_TOKEN=$T" >> "$GITHUB_ENV"; fi
+      - name: Read at most once a day (an upload on the same day reuses last night's programmes)
+        id: once
+        run: |
+          if [ -f _ingest/.read_at ] && [ $(( $(date +%s) - $(cat _ingest/.read_at 2>/dev/null || echo 0) )) -lt 72000 ]; then echo "read=no" >> "$GITHUB_OUTPUT"; echo "::notice::Programmes were read less than 20 hours ago; reusing them (one read a day at most)."; else echo "read=yes" >> "$GITHUB_OUTPUT"; fi
+      - name: Read venue programmes (capped, polite, facts only)
+        if: steps.once.outputs.read == 'yes'
+        continue-on-error: true
+        env:
+          INGEST_TM_KEY: ${{ secrets.TM_KEY }}
+          INGEST_SEOUL_KEY: ${{ secrets.SEOUL_KEY }}
+          INGEST_SEATGEEK_ID: ${{ secrets.SEATGEEK_ID }}
+          INGEST_CONTRIB_TOKEN: ${{ env.CONTRIB_TOKEN }}
+          INGEST_CONTRIB_URL: https://api.${{ env.TF_DOMAIN }}/api/contrib/pending
+        run: node tools/ingest.mjs --out _ingest --cities tools/ingest_cities.json --optout "$SRC/data/optout.json" --partners "$SRC/data/partners.json" --max-requests 3000 --max-minutes 20 && mkdir -p _ingest && date +%s > _ingest/.read_at
+      - name: Choose the host
+        id: where
+        run: |
+          CF=off; if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then if [ -f tools/cloudflare/GO_LIVE ]; then CF=live; else CF=preview; fi; fi
+          echo "cf=$CF" >> "$GITHUB_OUTPUT"; if [ "$CF" = live ]; then echo "target=cloudflare" >> "$GITHUB_OUTPUT"; else echo "target=github" >> "$GITHUB_OUTPUT"; fi
+          echo "Cloudflare: $CF"
+      - name: Assemble the website
+        env:
+          TARGET: ${{ steps.where.outputs.target }}
+          CF: ${{ steps.where.outputs.cf }}
+          SITE_DOMAIN: ${{ vars.SITE_DOMAIN }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          AFFILIATES: ${{ vars.AFFILIATES }}
+        run: |
+          mkdir -p _site _ingest
+          rsync -a --exclude '.git' --exclude '.github' --exclude '_site' --exclude '_ingest' --exclude 'tools' --exclude 'node_modules' --exclude '*.zip' "$SRC"/ _site/
+          mkdir -p _site/data/ingest && cp -r _ingest/. _site/data/ingest/
+          # every deploy gets its own build id, so open pages and the offline copy update themselves to the latest version
+          BUILD="$(date -u +%Y%m%d%H%M)-${GITHUB_RUN_ID}"
+          sed -i "s/__TF_BUILD__/$BUILD/g" _site/index.html _site/sw.js
+          printf '{"build":"%s"}' "$BUILD" > _site/version.json
+          if [ "$TARGET" = cloudflare ]; then sed -i 's#<meta name="tf-build"#<meta name="tf-contrib" content="on"><meta name="tf-build"#' _site/index.html; fi
+          # A79 partner programmes (repository variable AFFILIATES, e.g. {"ticketmaster.ch":"https://…/c/1/2/3?u={url}","seatgeek.com":"aid=123"}):
+          # checked here, then stamped into the page; links to those shops go through the programme and are marked sponsored
+          node -e 'const a=process.env.AFFILIATES||"";let j;try{j=JSON.parse(a)}catch(_){process.exit(0)}if(!j||typeof j!=="object"||Array.isArray(j))process.exit(0);const o={};for(const[k,v]of Object.entries(j)){if(!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(k)||typeof v!=="string")continue;if(/^https:\/\/[^\s"<>]+\{url\}[^\s"<>]*$/.test(v)||/^[\w-]{1,32}=[\w.-]{1,64}(&[\w-]{1,32}=[\w.-]{1,64})*$/.test(v))o[k.toLowerCase()]=v}if(!Object.keys(o).length)process.exit(0);const fs=require("fs"),f="_site/index.html",esc=JSON.stringify(o).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace("<meta name=\"tf-build\"","<meta name=\"tf-aff\" content=\""+esc+"\"><meta name=\"tf-build\""));console.log("Partner programmes on: "+Object.keys(o).join(", "))' || echo "::warning::AFFILIATES not applied"
+          # A71 alerts: the public half of the signing key (derived from the Cloudflare token; the private half never leaves this run)
+          if [ "$TARGET" = cloudflare ]; then K=$(node -e 'import("./tools/lib/push.mjs").then(m=>process.stdout.write(m.vapidFrom(process.env.CLOUDFLARE_API_TOKEN).publicKey)).catch(()=>{})' || true); if [ -n "$K" ]; then sed -i "s#<meta name=\"tf-build\"#<meta name=\"tf-push-key\" content=\"$K\"><meta name=\"tf-build\"#" _site/index.html; else echo "::warning::alerts key not derived (alerts stay off)"; fi; fi
+          # crawlable town pages with what is on in the next two weeks, and a sitemap that only moves when a page really changed
+          if [ -f _site/data/ingest/index.json ]; then node tools/town_pages.mjs --ingest _site/data/ingest --site _site; fi
+          [ -f _ingest/sitemap_state.json ] || cp tools/sitemap_state.json _ingest/sitemap_state.json 2>/dev/null || true
+          python3 tools/sitemap.py _site --state _ingest/sitemap_state.json
+          SIZE=$(du -sm _site | cut -f1); FILES=$(find _site -type f | wc -l); BIG=$(find _site -type f -size +24M | wc -l)
+          echo "Site: ${SIZE} MB, ${FILES} files, ${BIG} files over 24 MB"
+          test "$SIZE" -lt 900 && test "$FILES" -lt 19000 && test "$BIG" -eq 0
+          # the Cloudflare copy is taken before any github.io link rewrite, and checked by the public-output gate
+          # (GitHub-only builds never depend on it: without Cloudflare the gate only reports)
+          if [ "$CF" != off ]; then rm -rf _site_cf && cp -a _site _site_cf && node tools/cf_budget.mjs _site_cf; else node tools/cf_budget.mjs _site || echo "::warning::public-output gate found items (GitHub-only build continues)"; fi
+          # served from https://<owner>.github.io/<repo>/ until a custom domain is set: make root links point inside the repo path
+          # A77: the custom domain set under Settings → Pages is read here, so tixterex.com works without any extra setting
+          if [ -z "$SITE_DOMAIN" ]; then SITE_DOMAIN=$(GH_TOKEN="$GH_TOKEN" gh api "repos/$REPO/pages" --jq '.cname // empty' 2>/dev/null || true); fi
+          if ! printf '%s' "$SITE_DOMAIN" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then SITE_DOMAIN=""; fi   # only a real host name counts (an error message never does)
+          if [ -n "$SITE_DOMAIN" ]; then echo "Custom domain: $SITE_DOMAIN"; fi
+          OWNER_LC=$(echo "$OWNER" | tr 'A-Z' 'a-z'); NAME="${REPO#*/}"; NAME_LC=$(echo "$NAME" | tr 'A-Z' 'a-z')
+          if [ "$TARGET" = github ] && [ -z "$SITE_DOMAIN" ] && [ "$NAME_LC" != "$OWNER_LC.github.io" ]; then
+            find _site -type f \( -name '*.html' -o -name '*.webmanifest' \) ! -path '_site/index.html' -print0 | xargs -0 sed -i -E "s#((href|src|action)=\"|\"(src|start_url)\": *\")/([^/\"]|\")#\1/$NAME/\4#g"
+            # the app page itself: only its own page links (its scripts contain example paths that must stay as they are)
+            sed -i -E "s#(href|src)=\"/(legal\.html|coverage\.html|venues\.html|about\.html|terms\.html|events/|favicon|apple-touch|icon-|site\.webmanifest|og\.png)#\1=\"/$NAME/\2#g" _site/index.html
+            echo "Links rewritten for https://$OWNER_LC.github.io/$NAME/"
+          fi
+      - name: Keep tonight's programmes for tomorrow
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: _ingest
+          key: ingest-${{ github.run_id }}
+      - name: Deploy to Cloudflare (preview until GO_LIVE; website assets-only, zero extra cost)
+        if: steps.where.outputs.cf != 'off'
+        continue-on-error: ${{ steps.where.outputs.cf == 'preview' }}
+        working-directory: tools/cloudflare
+        env:
+          CF: ${{ steps.where.outputs.cf }}
+        run: |
+          W="npx --yes wrangler@4.160.0"
+          # the website: static files only — no script, so no request of any kind is ever billed
+          node -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync("wrangler.jsonc","utf8").replace(/^\s*\/\/.*$/mg,""));if(process.argv[1]!=="live"){delete c.routes;c.workers_dev=true;}fs.writeFileSync("wrangler.json",JSON.stringify(c,null,1))' "$CF"
+          # go-live only: free the two web hostnames from the old GitHub Pages records right before the website attaches to them
+          if [ "$CF" = live ]; then node guard.mjs dnsclear || true; fi
+          $W deploy --config wrangler.json
+          [ "$CF" = live ] || exit 0
+          # the suggestion box (api.tixterex.com): reachable only while the account is below 70% of its included script
+          # requests; otherwise it is deployed WITHOUT any address, so no request can reach it (nothing can be billed)
+          APIS=$(node guard.mjs usage || echo off)
+          cd api
+          find_id() { $W d1 list --json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s).find(d=>d.name==="tixterex-contrib");process.stdout.write(x?x.uuid:"")}catch(_){}})'; }
+          ID=$(find_id); if [ -z "$ID" ]; then $W d1 create tixterex-contrib >/dev/null; ID=$(find_id); fi
+          test -n "$ID"
+          # A72: the private event feed for the alert run, built from tonight's programmes (never published on the website)
+          node ../../alerts_feed.mjs ../../../_site/data/ingest feed/upcoming.json || echo '{"rows":[]}' > feed/upcoming.json
+          node -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync("wrangler.jsonc","utf8").replace(/^\s*\/\/.*$/mg,""));c.d1_databases[0].database_id=process.argv[1];if(process.argv[2]!=="on"){delete c.routes;c.workers_dev=false;c.preview_urls=false;c.triggers={crons:[]};}fs.writeFileSync("wrangler.json",JSON.stringify(c,null,1))' "$ID" "$APIS"
+          $W d1 execute tixterex-contrib --remote --yes --config wrangler.json --file ../schema.sql
+          $W deploy --config wrangler.json
+          if [ "$APIS" != on ]; then echo "Suggestion box unreachable this month (zero extra cost)"; exit 0; fi
+          printf '%s' "$CONTRIB_TOKEN" | $W secret put CONTRIB_TOKEN --config wrangler.json
+          node ../guard.mjs ratelimit || true
+          # A72 alerts: the signing key goes into the script's encrypted secret store (the alerts are sent by the script's
+          # own hourly schedule on Cloudflare — nothing that talks to visitors' phones runs on GitHub)
+          node -e 'import("../../lib/push.mjs").then(m=>process.stdout.write(JSON.stringify(m.vapidFrom(process.env.CLOUDFLARE_API_TOKEN).jwk)))' | $W secret put VAPID_JWK --config wrangler.json || echo "::warning::alerts key not stored (alerts pause, nothing else affected)"
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.where.outputs.target == 'github'
+        with:
+          path: _site
   deploy:
     needs: build
-    runs-on: ubuntu-24.04
+    if: needs.build.outputs.target == 'github'
+    runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      pages: write
-      id-token: write
-      contents: read
-      actions: read
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-    - name: Do not publish a superseded commit
-      id: fresh
-      env:
-        GH_TOKEN: ${{ github.token }}
-        REPO: ${{ github.repository }}
-        BRANCH: ${{ github.ref_name }}
-        SHA: ${{ github.sha }}
-      run: |-
-        set -euo pipefail
-        python3 - <<'PY_FRESH'
-        import json,os,subprocess,urllib.parse
-        endpoint='repos/'+os.environ['REPO']+'/git/ref/heads/'+urllib.parse.quote(os.environ['BRANCH'],safe='')
-        r=subprocess.run(['gh','api',endpoint],capture_output=True,text=True,check=True)
-        head=json.loads(r.stdout)['object']['sha']
-        current=head==os.environ['SHA']
-        with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('publish='+str(current).lower()+'\n')
-        if not current:
-            with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write('A newer upload exists. This older build was not published.\n')
-        PY_FRESH
-    - name: Deploy the validated website
-      id: deployment
-      uses: actions/deploy-pages@v5
-      if: ${{ steps.fresh.outputs.publish == 'true' }}
-    - name: Verify the public build and actual HTML
-      env:
-        SITE_URL: ${{ steps.deployment.outputs.page_url }}
-        EXPECTED_BUILD: ${{ needs.build.outputs.build }}
-        EXPECTED_SHA256: ${{ needs.build.outputs.site_sha256 }}
-      run: |
-        set -euo pipefail
-        mkdir -p _verify
-        python3 - <<'PY_VERIFY'
-        import hashlib, json, os, time, urllib.parse, urllib.request
-        from pathlib import Path
-        base = os.environ['SITE_URL'].rstrip('/')+'/'
-        parsed = urllib.parse.urlsplit(base)
-        if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
-            raise SystemExit('Invalid Pages deployment URL.')
-        expected = os.environ['EXPECTED_BUILD']
-        sha = os.environ['EXPECTED_SHA256']
-        report = {'url':base, 'expectedBuild':expected, 'verified':False, 'collectionVerified':False, 'coverage10075Measured':False, 'attempts':[]}
-        def get(path, limit):
-            target = urllib.parse.urljoin(base,path)+'?build_check='+urllib.parse.quote(expected)
-            req = urllib.request.Request(target,headers={'Cache-Control':'no-cache','User-Agent':'TixTerex-Deployment-Check/1.0'})
-            with urllib.request.urlopen(req,timeout=12) as r:
-                body = r.read(limit+1)
-                if len(body)>limit: raise ValueError('Response exceeds the verification limit')
-                return body
-        for attempt in range(6):
-            try:
-                version = json.loads(get('version.json', 65536))
-                info = json.loads(get('release-info.json', 65536))
-                html = get('index.html', 25000000)
-                if version.get('build') != expected or info.get('build') != expected:
-                    raise ValueError('The public address is still serving a different build.')
-                if info.get('siteSha256') != sha or hashlib.sha256(html).hexdigest() != sha:
-                    raise ValueError('The public HTML does not match the uploaded build.')
-                report['verified'] = True
-                report['applicationRelease'] = info.get('applicationRelease')
-                try:
-                    report['supply'] = json.loads(get('supply-health.json',2000000))
-                except Exception as exc:
-                    report['supplyError'] = str(exc)
-                break
-            except Exception as exc:
-                report['attempts'].append({'attempt':attempt+1,'error':str(exc)})
-                if attempt < 5: time.sleep(15)
-        Path('_verify/live-check.json').write_text(json.dumps(report,indent=2)+'\n')
-        with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
-            if report['verified']:
-                f.write('\n## UPDATED WEBSITE VERIFIED LIVE\n\n'+base+'\n\nBuild **'+expected+'** and the public HTML match the uploaded artifact.\n\n')
-                f.write('Crawler operation, mobile behaviour, and the 100/75 event target are separate and are not certified by this deployment check.\n')
-            else:
-                f.write('\n## DEPLOYMENT FINISHED, PUBLIC VERSION NOT VERIFIED\n\n')
-                f.write('The update was submitted to Pages, but its public content could not yet be verified. See live-check.json.\n')
-        print(json.dumps(report,indent=2))
-        if not report['verified']:
-            raise SystemExit(1)
-        PY_VERIFY
-      if: ${{ steps.fresh.outputs.publish == 'true' }}
-    - name: Retain live verification evidence
-      if: ${{ always() }}
-      uses: actions/upload-artifact@v7
-      with:
-        name: tixterex-live-check-${{ github.run_id }}-${{ github.run_attempt }}
-        path: _verify/
-        if-no-files-found: ignore
-        retention-days: 14
-    concurrency:
-      group: tixterex-pages
-      cancel-in-progress: false
-    if: ${{ needs.build.outputs.ready == 'true' }}
+      - id: deployment
+        uses: actions/deploy-pages@v4
+  # A70 (owner, 21 Nov 2026): keep the repository tidy after every good update — nothing here touches the website files.
+  #  · releases: the newest 3 stay (the live one and two to go back to); older ones and their tags are removed
+  #  · workflow runs: the newest 60 stay;  · caches: the newest 2 nightly-state caches stay
+  tidy:
+    needs: [build, deploy]
+    if: ${{ always() && needs.build.result == 'success' && needs.deploy.result != 'failure' && needs.deploy.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Tidy releases, old runs and caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release list -R "$REPO" --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' | while read -r t; do
+            [ -n "$t" ] && gh release delete "$t" -R "$REPO" --cleanup-tag -y && echo "removed release $t" || true; done
+          gh api "repos/$REPO/actions/runs?per_page=100" --jq '.workflow_runs | sort_by(.created_at) | reverse | .[60:] | .[].id' | while read -r id; do
+            [ -n "$id" ] && gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null && echo "removed run $id" || true; done
+          gh api "repos/$REPO/actions/caches?per_page=100" --jq '.actions_caches | sort_by(.created_at) | reverse | .[2:] | .[].id' | while read -r id; do
+            [ -n "$id" ] && gh api -X DELETE "repos/$REPO/actions/caches/$id" >/dev/null && echo "removed cache $id" || true; done
+          # A92: older copies of an uploaded zip ("tixterex-release (5).zip" next to "(8)") are removed; the newest of each kind stays
+          for K in release places-1 places-2; do
+            gh api "repos/$REPO/contents/" --jq '.[] | select(.name | test("^tixterex-'"$K"'.*\\.zip$")) | "\(.name)\t\(.sha)"' | while IFS=$'\t' read -r n sha; do
+              t=$(gh api "repos/$REPO/commits?path=$(printf %s "$n" | jq -sRr @uri)&per_page=1" --jq '.[0].commit.committer.date'); echo "$(date -d "$t" +%s)	$n	$sha"; done | sort -rn | tail -n +2 | while IFS=$'\t' read -r t n sha; do
+              gh api -X DELETE "repos/$REPO/contents/$(printf %s "$n" | jq -sRr @uri)" -f message="Tidy: remove older upload $n" -f sha="$sha" >/dev/null && echo "removed old upload $n" || true; done; done
+          echo "Repository tidy."
